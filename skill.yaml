@@ -1,0 +1,8 @@
+# VirusTotal 扫描工具
+
+require_skills:
+  - name: virus-scanner
+    path: skill.md
+
+repo:
+  url: https://github.com/huangli007/virus_auto

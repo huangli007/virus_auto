@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# 虚拟环境
+venv/
+.venv/
+env/
+
+# 配置文件（含 API Key，不提交）
+virus_scanner_config.json
+
+# 扫描报告（运行时生成）
+scan_reports/
+
+# 系统
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# IDE
+.vscode/
+.idea/
