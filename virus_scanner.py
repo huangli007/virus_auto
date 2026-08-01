@@ -20,6 +20,9 @@ VirusTotal 批量扫描工具 v2.0
   python virus_scanner.py --key-file keys.txt           # 从文件加载 key 池
   python virus_scanner.py --list-keys                   # 查看 key 池状态
   python virus_scanner.py -f "D:\Downloads"             # 直接指定文件夹
+  python virus_scanner.py --report-filter scan_data.json   # 筛选报毒报告
+  python virus_scanner.py --err scan_data.json              # 文本报毒测试报告
+  python virus_scanner.py --gen-emails detections_dir      # 逐封确认后生成申诉邮件
 """
 
 import os
@@ -28,6 +31,7 @@ import json
 import time
 import hashlib
 import argparse
+import threading
 from datetime import datetime
 from pathlib import Path
 
@@ -88,6 +92,64 @@ FILE_PRIORITY = {
     ".ocx": 7, ".apk": 7, ".ipa": 7, ".app": 7,
     ".js": 8, ".jse": 8, ".wsf": 8, ".wsh": 8,
 }
+
+
+# ============================================================
+#  快捷键控制：Ctrl+Z 暂停 / Ctrl+T 继续
+# ============================================================
+
+class PauseController:
+    """全局快捷键：Ctrl+Z 暂停扫描，Ctrl+T 继续。"""
+
+    def __init__(self):
+        self._paused = threading.Event()
+        self._paused.set()  # 初始为"未暂停"状态（set = 不阻塞）
+        self._listener = None
+        self._active = False
+
+    def start(self):
+        if self._active:
+            return
+        try:
+            from pynput import keyboard
+        except ImportError:
+            print("[提示] pynput 未安装，快捷键不可用。pip install pynput")
+            return
+
+        self._active = True
+        self._ctrl_pressed = False
+
+        def on_press(key):
+            try:
+                if key == keyboard.Key.ctrl_l or key == keyboard.Key.ctrl_r:
+                    self._ctrl_pressed = True
+                elif self._ctrl_pressed and hasattr(key, 'char'):
+                    if key.char == 'z':
+                        self._paused.clear()  # clear = 阻塞 = 暂停
+                        print("\n⏸  [Ctrl+Z] 扫描已暂停，按 Ctrl+T 继续...", flush=True)
+                    elif key.char == 't':
+                        self._paused.set()    # set = 不阻塞 = 继续
+                        print("\n▶  [Ctrl+T] 扫描已继续", flush=True)
+            except Exception:
+                pass
+
+        def on_release(key):
+            if key == keyboard.Key.ctrl_l or key == keyboard.Key.ctrl_r:
+                self._ctrl_pressed = False
+
+        self._listener = keyboard.Listener(on_press=on_press, on_release=on_release)
+        self._listener.daemon = True
+        self._listener.start()
+        print("[快捷键] Ctrl+Z 暂停 | Ctrl+T 继续")
+
+    def wait_if_paused(self):
+        """在扫描循环中调用，若暂停则阻塞直到恢复。"""
+        self._paused.wait()
+
+    def stop(self):
+        self._active = False
+        if self._listener:
+            self._listener.stop()
 
 
 # ============================================================
@@ -517,6 +579,19 @@ def vt_request(method, endpoint, api_key, key_mgr, record_quota=True):
 
     _last_request_time = time.time()
 
+    # HTTP 429 限速重试（最多 3 次，指数退避）
+    retry_count = 0
+    while resp.status_code == 429 and retry_count < 3:
+        retry_count += 1
+        wait = 60 * retry_count
+        print(f"\n  [HTTP 429] 请求限速，等待 {wait}s 后重试 ({retry_count}/3)...", flush=True)
+        time.sleep(wait)
+        _last_request_time = time.time()
+        if method == "GET":
+            resp = requests.get(url, headers=headers, timeout=30)
+        else:
+            resp = requests.post(url, headers=headers, timeout=60)
+
     if record_quota:
         key_mgr.record_call()
     return resp
@@ -576,6 +651,22 @@ def upload_file(api_key, file_path: Path, key_mgr):
             files={"file": (file_path.name, f)},
             timeout=120,
         )
+
+    # HTTP 429 限速重试（最多 3 次，指数退避）
+    retry_count = 0
+    while resp.status_code == 429 and retry_count < 3:
+        retry_count += 1
+        wait = 60 * retry_count
+        print(f"\n  [HTTP 429] 上传限速，等待 {wait}s 后重试 ({retry_count}/3)...", flush=True)
+        time.sleep(wait)
+        _update_last_request_time()
+        with open(file_path, "rb") as f:
+            resp = requests.post(
+                upload_url,
+                headers={"x-apikey": api_key},
+                files={"file": (file_path.name, f)},
+                timeout=120,
+            )
 
     if resp.status_code == 200:
         return resp.json()
@@ -836,6 +927,10 @@ def parse_args():
                         help="指定文件或文件夹路径（支持多个，文件直接扫描，文件夹递归扫描）")
     parser.add_argument("--report-filter", default=None, metavar="SCAN_DATA_JSON",
                         help="从已有 scan_data JSON 筛选报毒文件，生成仅含报毒项的 HTML 报告")
+    parser.add_argument("--err", default=None, metavar="SCAN_DATA_JSON",
+                        help="输出报毒文件测试报告（文本），列出所有恶意/可疑文件及引擎详情")
+    parser.add_argument("--gen-emails", default=None, metavar="SCAN_DATA_OR_DIR",
+                        help="从 scan_data JSON 或 detections 目录自动筛选报毒文件，逐封确认生成申诉邮件")
     return parser.parse_args()
 
 
@@ -895,6 +990,237 @@ def main():
             f.write(html)
         print(f"已生成报毒报告: {out_path}")
         print(f"  共 {len(filtered)} 个文件（恶意: {sum(1 for r in filtered if r.get('malicious', 0) > 0)}，可疑: {sum(1 for r in filtered if r.get('malicious', 0) == 0 and r.get('suspicious', 0) > 0)}）")
+        return
+
+    # ----- 报毒测试报告命令 ----
+
+    if args.err:
+        json_path = Path(args.err)
+        if not json_path.is_file():
+            print(f"错误: 文件不存在 - {json_path}")
+            return
+        with open(json_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, list):
+            print("错误: JSON 格式不正确，应为数组")
+            return
+
+        detections_list = [r for r in data if r.get("malicious", 0) > 0 or r.get("suspicious", 0) > 0]
+        if not detections_list:
+            print("没有报毒文件。")
+            return
+
+        print(f"\n报毒文件测试报告（{len(detections_list)} 个文件）")
+        print("=" * 70)
+
+        for idx, r in enumerate(detections_list, 1):
+            fp = r.get("filepath", r.get("filename", "?"))
+            sha = r.get("sha256", "?")
+            engines = r.get("engines", {})
+            det = [(ename, info.get("result", info.get("category", "?")))
+                   for ename, info in engines.items()
+                   if info.get("category") in ("malicious", "suspicious")]
+
+            print(f"\n  [{idx}] {fp}")
+            print(f"      SHA256: {sha}")
+            print(f"      恶意: {r.get('malicious', 0)}  可疑: {r.get('suspicious', 0)}")
+            for ename, threat in det:
+                cat = engines[ename].get("category", "?")
+                tag = "M" if cat == "malicious" else "S"
+                print(f"      [{tag}] {ename}: {threat}")
+
+        print(f"\n{'=' * 70}")
+        print(f"  合计: {sum(1 for r in detections_list if r.get('malicious', 0) > 0)} 恶意, "
+              f"{sum(1 for r in detections_list if r.get('malicious', 0) == 0 and r.get('suspicious', 0) > 0)} 可疑")
+        return
+
+    # ----- 生成申诉邮件命令 ----
+
+    if args.gen_emails:
+        target = Path(args.gen_emails)
+
+        # 动态导入 generate_fp_emails 模块
+        import importlib.util
+        gfe_path = Path(__file__).parent / "generate_fp_emails.py"
+        spec = importlib.util.spec_from_file_location("generate_fp_emails", gfe_path)
+        gfe = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(gfe)
+
+        # 收集所有待生成邮件
+        email_queue = []
+        ts = ""
+
+        if target.is_file() and target.suffix == ".json":
+            # 模式 1: 直接从 scan_data JSON 自动筛选报毒文件
+            with open(target, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if not isinstance(data, list):
+                print("错误: JSON 格式不正确，应为数组")
+                return
+
+            detections_data = [r for r in data if r.get("malicious", 0) > 0 or r.get("suspicious", 0) > 0]
+            if not detections_data:
+                print("没有报毒文件，无需生成邮件。")
+                return
+
+            print(f"从 {target.name} 筛选出 {len(detections_data)} 个报毒文件\n")
+
+            for r in detections_data:
+                file_name = r.get("filename", "?")
+                file_path = r.get("filepath", file_name)
+                sha256 = r.get("sha256", "")
+                vt_link = f"https://www.virustotal.com/gui/file/{sha256}" if sha256 else ""
+                engines = r.get("engines", {})
+                for ename, info in engines.items():
+                    cat = info.get("category", "")
+                    if cat not in ("malicious", "suspicious"):
+                        continue
+                    threat = info.get("result", info.get("category", "?"))
+                    body, recipient = gfe.generate_email(file_name, sha256, vt_link, ename, threat)
+                    if body is None:
+                        continue
+                    email_queue.append({
+                        "file_name": file_name,
+                        "file_path": file_path,
+                        "engine": ename,
+                        "threat": threat,
+                        "sha256": sha256,
+                        "vt_link": vt_link,
+                        "recipient": recipient,
+                        "body": body,
+                    })
+
+            ts = target.stem.split("scan_data_", 1)[-1] if "scan_data_" in target.stem \
+                else datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        elif target.is_dir():
+            # 模式 2: 从 detections 目录读取（兼容旧用法）
+            json_files = sorted(target.glob("*.json"))
+            if not json_files:
+                print(f"错误: 目录下没有 JSON 文件 - {target}")
+                return
+
+            for jf in json_files:
+                with open(jf, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                file_name = data.get("file_name", jf.stem)
+                file_path = data.get("file_path", file_name)
+                sha256 = data.get("sha256", "")
+                vt_link = data.get("virus_total_link", "")
+                for det in data.get("detections", []):
+                    engine = det.get("engine", "Unknown")
+                    threat = det.get("name", "Unknown")
+                    body, recipient = gfe.generate_email(file_name, sha256, vt_link, engine, threat)
+                    if body is None:
+                        print(f"  [{engine}] 跳过 (无邮箱)")
+                        continue
+                    email_queue.append({
+                        "file_name": file_name,
+                        "file_path": file_path,
+                        "engine": engine,
+                        "threat": threat,
+                        "sha256": sha256,
+                        "vt_link": vt_link,
+                        "recipient": recipient,
+                        "body": body,
+                    })
+
+            ts = target.name.split("_", 1)[-1] if "_" in target.name \
+                else datetime.now().strftime("%Y%m%d_%H%M%S")
+        else:
+            print(f"错误: 路径不存在或不是 JSON 文件/目录 - {target}")
+            return
+
+        if not email_queue:
+            print("没有可生成的邮件（所有引擎均无邮箱联系方式）。")
+            return
+
+        print(f"\n共 {len(email_queue)} 封待确认邮件：\n")
+
+        confirmed = []
+        confirm_all = False
+        for i, em in enumerate(email_queue):
+            if confirm_all:
+                confirmed.append(em)
+                print(f"  [{i+1}/{len(email_queue)}] 已确认  {em['file_name']} → {em['engine']} → {em['recipient']}")
+                continue
+
+            # 展示邮件信息
+            print("-" * 60)
+            print(f"  [{i+1}/{len(email_queue)}]")
+            print(f"  文件:   {em['file_path']}")
+            print(f"  SHA256: {em['sha256']}")
+            print(f"  引擎:   {em['engine']}")
+            print(f"  报毒:   {em['threat']}")
+            print(f"  收件人: {em['recipient']}")
+            print(f"  VT链接: {em['vt_link']}")
+            print("-" * 60)
+            print(em['body'])
+            print("-" * 60)
+
+            while True:
+                choice = input("  [y]确认 [n]跳过 [a]全部确认 [q]退出: ").strip().lower()
+                if choice == "y":
+                    confirmed.append(em)
+                    break
+                elif choice == "n":
+                    print(f"  → 已跳过\n")
+                    break
+                elif choice == "a":
+                    confirmed.append(em)
+                    confirm_all = True
+                    break
+                elif choice == "q":
+                    print(f"\n  已退出，共确认 {len(confirmed)}/{len(email_queue)} 封。")
+                    break
+                else:
+                    print("  请输入 y / n / a / q")
+            if choice == "q":
+                break
+
+        if not confirmed:
+            print("没有确认的邮件，退出。")
+            return
+
+        # 写入确认的邮件
+        ts = det_dir.name.split("_", 1)[-1] if "_" in det_dir.name else datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_dir = det_dir.parent / f"emails_{ts}"
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        for em in confirmed:
+            safe_file = "".join(c if c.isalnum() or c in "._- " else "_" for c in em["file_name"])
+            safe_engine = "".join(c if c.isalnum() or c in "._- " else "_" for c in em["engine"])
+            email_path = output_dir / f"{safe_file}__{safe_engine}.txt"
+            with open(email_path, "w", encoding="utf-8") as f:
+                f.write(f"To: {em['recipient']}\n")
+                f.write(f"Subject: VirusTotal False Positive Report\n")
+                f.write(f"{'=' * 60}\n\n")
+                f.write(em["body"])
+
+        # 汇总清单
+        summary_path = output_dir / "_summary.txt"
+        with open(summary_path, "w", encoding="utf-8") as f:
+            for em in confirmed:
+                f.write(f"[{em['file_name']}] {em['engine']}: {em['threat']} → {em['recipient']}\n")
+
+        # 生成已申诉文件 MD 文档
+        md_path = output_dir / "_sent.md"
+        with open(md_path, "w", encoding="utf-8") as f:
+            f.write(f"# 误报申诉发送记录\n\n")
+            f.write(f"生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+            f.write(f"| # | 文件 | SHA256 | 引擎 | 报毒名 | 收件人 |\n")
+            f.write(f"|---|------|--------|------|--------|--------|\n")
+            for idx, em in enumerate(confirmed, 1):
+                sha_short = em["sha256"][:12] + "..." if len(em["sha256"]) > 12 else em["sha256"]
+                f.write(f"| {idx} | {em['file_path']} | {sha_short} | {em['engine']} | {em['threat']} | {em['recipient']} |\n")
+            f.write(f"\n共 **{len(confirmed)}** 封申诉邮件已确认发送。\n")
+
+        print(f"\n{'=' * 60}")
+        print(f"  已确认 {len(confirmed)}/{len(email_queue)} 封")
+        print(f"  邮件目录: {output_dir}")
+        print(f"  汇总清单: {summary_path}")
+        print(f"  申诉记录: {md_path}")
+        print(f"{'=' * 60}")
         return
 
     # ----- 扫描流程 -----
@@ -985,6 +1311,9 @@ def main():
     report_path = OUTPUT_DIR / f"scan_report_{timestamp}.html"
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
+    pause_ctrl = PauseController()
+    pause_ctrl.start()
+
     def _refresh_report():
         """每扫完一个文件立即刷新报告，确保中断时不留空白"""
         html = generate_html_report(results, source_desc, len(skipped_text))
@@ -999,6 +1328,7 @@ def main():
         _refresh_report()
 
     for i, file_path in enumerate(files, 1):
+        pause_ctrl.wait_if_paused()
         api_key = key_mgr.current_key()
         print(f"[{i}/{len(files)}] {file_path.name} ...", end=" ", flush=True)
 
@@ -1107,6 +1437,8 @@ def main():
     if det_count > 0:
         print(f"  报毒详情: {det_dir}")
     print(f"{'=' * 60}\n")
+
+    pause_ctrl.stop()
 
 
 if __name__ == "__main__":

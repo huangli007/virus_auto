@@ -1,23 +1,25 @@
 # VirusTotal 批量扫描 & 误报申诉工具
 
-基于 VirusTotal API 的自动化安全扫描工具，支持批量文件扫描、报毒详情提取、误报申诉邮件生成。
+基于 VirusTotal API 的自动化安全扫描工具，支持批量文件扫描、报毒详情提取、逐封确认生成误报申诉邮件。
 
 ## 功能
 
-| 模块 | 功能 |
+| 命令 | 功能 |
 |------|------|
-| `virus_scanner.py` | 指定文件/文件夹 → SHA-256 查重 → VT 扫描 → HTML + JSON 报告 |
-| `generate_fp_emails.py` | 读取报毒 JSON → 匹配厂家邮箱 → 生成误报申诉邮件模板 |
+| 扫描（默认） | 指定文件/文件夹 → SHA-256 查重 → VT 扫描 → HTML + JSON 报告 |
+| `--report-filter` | 从已有 scan_data JSON 筛选报毒文件，生成仅报毒 HTML 报告 |
+| `--gen-emails` | 从 scan_data JSON（或 detections 目录）自动筛选报毒项，逐封确认生成申诉邮件 |
 
 ### 核心特性
 
 - **多 Key 池**：配额耗尽自动切换，支持 key 文件批量导入
 - **类型优先级**：exe/dll/sys 优先扫描
 - **配额管控**：严格遵守 VT 公共 API 限制（4次/分钟，500次/天，155K次/月）
+- **配额优化**：本地缓存查已有报告 + 免费操作不计配额 + 渐进式轮询 + 首请求免空等
 - **增量扫描**：已有 VT 报告的文件跳过上传，直接复用结果
-- **报毒详情**：为每个报毒文件生成独立 JSON + Markdown
-- **邮件模板**：按引擎匹配 100+ 厂家联系方式，自动生成申诉邮件
-- **优先级排序**：exe > dll > bin > sys > … 确保高危类型先出结果
+- **报毒详情**：为每个报毒文件生成独立 JSON + Markdown（含 `file_path` 绝对路径）
+- **逐封确认**：生成申诉邮件前先展示邮件全文，逐封确认/跳过/全部确认/退出
+- **申诉记录**：确认后生成 `_sent.md`，表格记录已申诉文件的绝对路径、SHA256、引擎、收件人
 
 ## 环境要求
 
@@ -78,13 +80,23 @@ python virus_scanner.py --key-file keys.txt
 python virus_scanner.py --list-keys
 ```
 
-### 3. 生成误报申诉邮件
+### 3. 误报申诉邮件
 
-扫描完成后，运行邮件生成器：
+扫描完成后，使用 `--gen-emails` 自动筛选报毒文件并逐封确认生成申诉邮件：
 
 ```bash
-python generate_fp_emails.py scan_reports\detections_20260731_133301
+# 方式一：直接传入 scan_data JSON（推荐，自动筛选报毒文件）
+python virus_scanner.py --gen-emails scan_reports\scan_data_20260731_133301.json
+
+# 方式二：传入 detections 目录（兼容旧用法）
+python virus_scanner.py --gen-emails scan_reports\detections_20260731_133301
 ```
+
+交互流程：展示邮件全文（文件路径、SHA256、引擎、报毒名、收件人、正文），每封可选择：
+- `y` 确认
+- `n` 跳过
+- `a` 全部确认
+- `q` 退出
 
 生成的文件结构：
 
@@ -93,11 +105,20 @@ scan_reports/
 ├── scan_data_20260731_133301.json          # 原始扫描数据
 ├── scan_report_20260731_133301.html         # HTML 报告
 ├── detections_20260731_133301/              # 报毒文件详情
-│   ├── uninst.exe.json                      # JSON 详情
+│   ├── uninst.exe.json                      # JSON 详情（含 file_path）
 │   └── uninst.exe.md                        # Markdown 详情
 └── emails_20260731_133301/                  # 申诉邮件
     ├── uninst.exe__APEX.txt
-    └── _summary.txt                         # 汇总
+    ├── _summary.txt                         # 纯文本汇总
+    └── _sent.md                             # 申诉发送记录（表格）
+```
+
+### 4. 筛选报毒报告
+
+从已有 scan_data JSON 快速生成仅含报毒项的 HTML 报告：
+
+```bash
+python virus_scanner.py --report-filter scan_reports\scan_data_20260731_133301.json
 ```
 
 ## 输出说明
@@ -115,19 +136,19 @@ scan_reports/
 
 ```json
 {
-  "filename": "setup.exe",
-  "filepath": "D:\\Downloads\\setup.exe",
+  "file_name": "setup.exe",
+  "file_path": "D:\\Downloads\\setup.exe",
   "sha256": "abc123...",
+  "virus_total_link": "https://www.virustotal.com/gui/file/abc123...",
   "malicious": 1,
   "suspicious": 0,
-  "undetected": 70,
-  "harmless": 0,
-  "engines": {
-    "APEX": {
-      "category": "malicious",
-      "name": "Malicious"
+  "detections": [
+    {
+      "engine": "APEX",
+      "name": "Malicious",
+      "category": "malicious"
     }
-  }
+  ]
 }
 ```
 
@@ -161,6 +182,8 @@ I'm writing to report a false positive detection on my legitimate file.
 | `--add-key` | 交互/命令行添加 Key 到池 |
 | `--key-file` | 从文本文件加载 Key 池 |
 | `--list-keys` | 查看 Key 池状态与配额 |
+| `--report-filter` | 从 scan_data JSON 筛选报毒项生成 HTML 报告 |
+| `--gen-emails` | 从 scan_data JSON 或 detections 目录自动筛选报毒项生成申诉邮件 |
 
 ## 支持的扫描文件类型
 
