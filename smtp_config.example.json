@@ -1,0 +1,5 @@
+{
+  "host": "smtp.qq.com",
+  "port": 587,
+  "auth_code": "你的QQ邮箱SMTP授权码"
+}

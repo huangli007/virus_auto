@@ -159,6 +159,60 @@ VENDOR_CONTACTS = {
 SENDER_EMAIL = "1041032635@qq.com"
 SENDER_NAME = "cattle_chen"
 
+# ========== SMTP 配置 ==========
+SMTP_CONFIG_FILE = Path(__file__).parent / "smtp_config.json"
+
+SMTP_DEFAULTS = {
+    "host": "smtp.qq.com",
+    "port": 587,
+    "auth_code": "",
+}
+
+
+def load_smtp_config():
+    """加载 SMTP 配置，文件不存在则返回默认空配置"""
+    if SMTP_CONFIG_FILE.exists():
+        with open(SMTP_CONFIG_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return dict(SMTP_DEFAULTS)
+
+
+def save_smtp_config(config):
+    """保存 SMTP 配置到文件"""
+    SMTP_CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with open(SMTP_CONFIG_FILE, "w", encoding="utf-8") as f:
+        json.dump(config, f, indent=2, ensure_ascii=False)
+
+
+def send_fp_email(recipient, subject, body):
+    """通过 SMTP 发送误报申诉邮件，返回 (成功, 错误信息)"""
+    import smtplib
+    from email.mime.text import MIMEText
+
+    config = load_smtp_config()
+    auth_code = config.get("auth_code", "")
+    if not auth_code:
+        return False, "SMTP 授权码未配置"
+
+    msg = MIMEText(body, "plain", "utf-8")
+    msg["From"] = SENDER_EMAIL
+    msg["To"] = recipient
+    msg["Subject"] = subject
+
+    try:
+        server = smtplib.SMTP(config["host"], config["port"], timeout=30)
+        server.starttls()
+        server.login(SENDER_EMAIL, auth_code)
+        server.sendmail(SENDER_EMAIL, [recipient], msg.as_string())
+        server.quit()
+        return True, None
+    except smtplib.SMTPAuthenticationError:
+        return False, "SMTP 认证失败：授权码无效"
+    except smtplib.SMTPException as e:
+        return False, str(e)
+    except Exception as e:
+        return False, str(e)
+
 
 def generate_email(file_name, sha256, vt_link, engine, threat):
     """按模板生成邮件正文。无邮箱时返回 None"""

@@ -1,25 +1,32 @@
-# VirusTotal 批量扫描 & 误报申诉工具
+# VirusTotal 批量扫描 & 误报申诉工具 v3.0
 
 基于 VirusTotal API 的自动化安全扫描工具，支持批量文件扫描、报毒详情提取、逐封确认生成误报申诉邮件。
+
+v3.0 新增：项目分类管理、SHA-256 本地缓存去重、跳过已扫描文件节省配额。
 
 ## 功能
 
 | 命令 | 功能 |
 |------|------|
-| 扫描（默认） | 指定文件/文件夹 → SHA-256 查重 → VT 扫描 → HTML + JSON 报告 |
+| 扫描（默认） | 指定文件/文件夹 → SHA-256 缓存查重 → VT 扫描 → HTML + JSON 报告 |
 | `--report-filter` | 从已有 scan_data JSON 筛选报毒文件，生成仅报毒 HTML 报告 |
-| `--gen-emails` | 从 scan_data JSON（或 detections 目录）自动筛选报毒项，逐封确认生成申诉邮件 |
+| `--err` | 从 scan_data JSON 输出终端文本报毒测试报告 |
+| `--gen-emails` | 从 scan_data JSON（或 detections 目录）自动筛选报毒项，逐封确认生成并发送申诉邮件 |
+| `--excel` | 从 scan_data JSON 导出报毒清单 Excel（文件路径/报毒详情/VT链接/厂家联系方式/扫毒日期） |
+| `--cache-stats` | 查看本地扫描缓存统计 |
+| `--clear-cache` | 清空本地扫描缓存 |
 
 ### 核心特性
 
 - **多 Key 池**：配额耗尽自动切换，支持 key 文件批量导入
 - **类型优先级**：exe/dll/sys 优先扫描
 - **配额管控**：严格遵守 VT 公共 API 限制（4次/分钟，500次/天，155K次/月）
-- **配额优化**：本地缓存查已有报告 + 免费操作不计配额 + 渐进式轮询 + 首请求免空等
-- **增量扫描**：已有 VT 报告的文件跳过上传，直接复用结果
-- **报毒详情**：为每个报毒文件生成独立 JSON + Markdown（含 `file_path` 绝对路径）
-- **逐封确认**：生成申诉邮件前先展示邮件全文，逐封确认/跳过/全部确认/退出
-- **申诉记录**：确认后生成 `_sent.md`，表格记录已申诉文件的绝对路径、SHA256、引擎、收件人
+- **项目分类**：每次扫描创建独立项目目录 `projects/<名称>_<时间戳>/`，所有产出内聚
+- **本地缓存**：SHA-256 索引，已扫描文件自动跳过上传，大幅节省配额
+- **强制重扫**：`--no-cache` 忽略缓存强制上传
+- **报毒详情**：为每个报毒文件生成独立 JSON + Markdown
+- **逐封确认**：生成申诉邮件前先展示全文，逐封 y/n/a/q，确认后自动通过 SMTP 发送
+- **申诉记录**：确认后生成 `_sent.md`，表格记录已申诉文件及发送状态
 
 ## 环境要求
 
@@ -45,152 +52,116 @@ pip install -r requirements.txt
 ### 1. 扫描文件
 
 ```bash
-# 扫描单个文件
-python virus_scanner.py -p "D:\Downloads\setup.exe"
-
 # 扫描文件夹
-python virus_scanner.py -p "C:\Program Files\MyApp"
+python virus_scanner.py -f "C:\Program Files\MyApp"
+
+# 自定义项目名称
+python virus_scanner.py -f "C:\Target" --project-name MyProject
+
+# 强制重扫（忽略缓存）
+python virus_scanner.py -f "C:\Target" --no-cache
 
 # 混合路径扫描
 python virus_scanner.py -p "D:\file1.dll" "C:\Program Files\MyApp"
-
-# 指定文件夹（-f）
-python virus_scanner.py -f "D:\Downloads"
 
 # 不带参数进入交互模式（GUI 选文件夹）
 python virus_scanner.py
 ```
 
+扫描产物目录结构：
+
+```
+projects/
+└── Target/                      # 项目文件夹（同名扫描共享）
+    ├── scan_data.json            # 扫描结果 JSON
+    ├── report.html               # HTML 报告
+    └── detections/               # 报毒文件详情
+        ├── uninst.exe.json
+        └── uninst.exe.md
+```
+
 ### 2. 管理 API Key
 
 ```bash
-# 添加 key（推荐 --save-key 持久化）
-python virus_scanner.py -k YOUR_API_KEY --save-key
-
-# 交互添加
-python virus_scanner.py --add-key
-
-# 命令行添加
-python virus_scanner.py --add-key YOUR_API_KEY
-
-# 批量导入 key 文件（每行一个，# 注释）
-python virus_scanner.py --key-file keys.txt
-
-# 查看 key 池状态
-python virus_scanner.py --list-keys
+python virus_scanner.py -k YOUR_API_KEY --save-key    # 添加并持久化
+python virus_scanner.py --add-key                      # 交互添加
+python virus_scanner.py --add-key YOUR_API_KEY         # 命令行添加
+python virus_scanner.py --key-file keys.txt             # 从文件批量导入
+python virus_scanner.py --list-keys                    # 查看 Key 池
 ```
 
-### 3. 误报申诉邮件
-
-扫描完成后，使用 `--gen-emails` 自动筛选报毒文件并逐封确认生成申诉邮件：
+### 3. 缓存管理
 
 ```bash
-# 方式一：直接传入 scan_data JSON（推荐，自动筛选报毒文件）
-python virus_scanner.py --gen-emails scan_reports\scan_data_20260731_133301.json
-
-# 方式二：传入 detections 目录（兼容旧用法）
-python virus_scanner.py --gen-emails scan_reports\detections_20260731_133301
+python virus_scanner.py --cache-stats    # 查看缓存统计
+python virus_scanner.py --clear-cache    # 清空缓存
 ```
 
-交互流程：展示邮件全文（文件路径、SHA256、引擎、报毒名、收件人、正文），每封可选择：
-- `y` 确认
-- `n` 跳过
-- `a` 全部确认
-- `q` 退出
-
-生成的文件结构：
-
-```
-scan_reports/
-├── scan_data_20260731_133301.json          # 原始扫描数据
-├── scan_report_20260731_133301.html         # HTML 报告
-├── detections_20260731_133301/              # 报毒文件详情
-│   ├── uninst.exe.json                      # JSON 详情（含 file_path）
-│   └── uninst.exe.md                        # Markdown 详情
-└── emails_20260731_133301/                  # 申诉邮件
-    ├── uninst.exe__APEX.txt
-    ├── _summary.txt                         # 纯文本汇总
-    └── _sent.md                             # 申诉发送记录（表格）
-```
-
-### 4. 筛选报毒报告
-
-从已有 scan_data JSON 快速生成仅含报毒项的 HTML 报告：
+### 4. 误报申诉邮件
 
 ```bash
-python virus_scanner.py --report-filter scan_reports\scan_data_20260731_133301.json
+python virus_scanner.py --gen-emails <扫描结果文件或目录>
 ```
 
-## 输出说明
+交互流程：展示邮件全文（文件路径、SHA256、引擎、报毒名、收件人、正文），每封可选 y确认 / n跳过 / a全部确认 / q退出。确认后通过 SMTP 自动发送，同时生成 `.txt` 备份到 `emails_<ts>/` 目录。
 
-### HTML 报告
+#### SMTP 配置
 
-包含每个文件的完整扫描结果：
+工具默认使用 QQ 邮箱 SMTP，需配置授权码才能发送：
 
-- 文件路径、SHA-256、VT 链接
-- 报毒详情（恶意/可疑引擎及威胁名称）
-- 全部引擎检测统计
-- 彩色标签区分恶意（红）/可疑（橙）/安全（绿）
-
-### JSON 数据
+1. 登录 QQ 邮箱 → 设置 → 账户 → POP3/SMTP 服务 → 生成授权码
+2. 编辑 `smtp_config.json` 填入授权码：
 
 ```json
 {
-  "file_name": "setup.exe",
-  "file_path": "D:\\Downloads\\setup.exe",
-  "sha256": "abc123...",
-  "virus_total_link": "https://www.virustotal.com/gui/file/abc123...",
-  "malicious": 1,
-  "suspicious": 0,
-  "detections": [
-    {
-      "engine": "APEX",
-      "name": "Malicious",
-      "category": "malicious"
-    }
-  ]
+  "host": "smtp.qq.com",
+  "port": 587,
+  "auth_code": "你的QQ邮箱授权码"
 }
 ```
 
-### 邮件模板
+### 5. 筛选报毒报告
 
-仅对有邮箱的引擎生成邮件，纯网页表单提交的厂家自动跳过。邮件格式：
-
+```bash
+python virus_scanner.py --report-filter projects\Target\scan_data.json
 ```
-To: vt-pan-false-positive@paloaltonetworks.com
-Subject: VirusTotal False Positive Report
 
-I'm writing to report a false positive detection on my legitimate file.
+### 6. 导出报毒 Excel
 
-1. File name: myapp.exe
-2. SHA256: abc123...
-3. VirusTotal link: https://www.virustotal.com/gui/file/abc123...
-4. Detection engine: Palo Alto
-5. Detection name: generic.ml
-
-...
+```bash
+python virus_scanner.py --excel projects\Target\scan_data.json
 ```
+
+生成 `报毒清单_<json文件名>.xlsx`，包含五列：文件路径、报毒详情、VT链接、厂家联系方式、扫毒日期。恶意行为红色底色，可疑行为橙色底色。
 
 ## 命令行参数
 
 | 参数 | 说明 |
 |------|------|
-| `-p` / `--path` | 指定文件或文件夹路径（支持多个） |
-| `-f` / `--folder` | 指定文件夹（单路径） |
-| `-k` / `--key` | 临时 API Key |
-| `--save-key` | 将 -k 传入的 Key 持久化保存 |
-| `--add-key` | 交互/命令行添加 Key 到池 |
+| `-k`, `--key` | 临时使用指定的 API Key |
+| `--save-key` | 配合 `-k` 将 Key 持久化到池 |
+| `--add-key` | 添加 API Key 到池 |
 | `--key-file` | 从文本文件加载 Key 池 |
-| `--list-keys` | 查看 Key 池状态与配额 |
+| `--list-keys` | 查看 Key 池状态 |
+| `-f`, `--folder` | 扫描文件夹路径 |
+| `-p`, `--path` | 文件或文件夹路径（支持多个） |
+| `--project-name` | 自定义项目名称 |
+| `--no-cache` | 忽略本地缓存，强制上传 |
+| `--cache-stats` | 显示缓存统计 |
+| `--clear-cache` | 清空本地扫描缓存 |
 | `--report-filter` | 从 scan_data JSON 筛选报毒项生成 HTML 报告 |
-| `--gen-emails` | 从 scan_data JSON 或 detections 目录自动筛选报毒项生成申诉邮件 |
+| `--err` | 从 scan_data JSON 输出终端文本报毒测试报告 |
+| `--gen-emails` | 从 scan_data JSON 或 detections 目录生成并发送申诉邮件 |
+| `--excel` | 从 scan_data JSON 导出报毒清单 Excel |
 
 ## 支持的扫描文件类型
 
-60+ 种病毒载体扩展名：exe, dll, sys, bin, scr, com, bat, cmd, ps1, vbs, js, jar, msi, doc, docx, xls, xlsx, ppt, pptx, pdf, zip, rar, 7z, iso, img, elf, mach-o, apk, ipa, ...
+可执行文件: exe, dll, sys, bat, cmd, ps1, vbs, vbe, js, jse, wsf, wsh, msi, scr, cpl, pif, com, drv, ocx, bin
 
-文本类文件（txt, md, log, json, xml, csv 等）自动排除。
+包/安装: apk, ipa, app, deb, rpm, dmg, iso, img, vhd, vhdx
 
-## License
+文档: pdf, doc, docx, docm, xls, xlsx, xlsm, ppt, pptx, pptm, rtf, mdb, accdb, htm, html
 
-MIT
+压缩: zip, rar, 7z, tar, gz, bz2, xz, cab, arj, lzh, ace, jar, war, ear
+
+其他: swf, lnk, url, torrent, chm, eml, msg, hta
