@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-VirusTotal 批量扫描工具
+VirusTotal 批量扫描工具 v2.0
 手动选择文件夹 → 过滤病毒载体文件 → 上传 VirusTotal 扫描 → 生成 HTML 报告
+优化：本地缓存 + 免费操作不计配额 + 渐进式轮询 + 首请求免空等
 
 功能：
   - 支持多 API Key 池，配额耗尽自动切换
@@ -41,6 +42,7 @@ except ImportError:
 # ========== 配置 ==========
 CONFIG_DIR = Path(__file__).parent
 CONFIG_FILE = CONFIG_DIR / "virus_scanner_config.json"
+SCAN_CACHE_FILE = CONFIG_DIR / "scan_cache.json"     # v2.0: 本地扫描缓存
 OUTPUT_DIR = CONFIG_DIR / "scan_reports"
 
 VT_API_BASE = "https://www.virustotal.com/api/v3"
@@ -51,7 +53,11 @@ RATE_LIMIT_INTERVAL = 60.0 / RATE_LIMIT_PER_MINUTE  # 每次请求间隔 15 秒
 DAILY_QUOTA = 500                     # 每日 500 次查询（每个 key）
 MONTHLY_QUOTA = 155_000               # 每月 15.5 万次查询（每个 key）
 MAX_FILE_SIZE = 32 * 1024 * 1024      # 32MB，超过需用 upload_url
-EST_CALLS_PER_FILE = 6                # 预估每个文件的 API 调用数
+EST_CALLS_PER_FILE = 1                # v2.0: 仅查报告扣配额，上传和轮询免费
+CACHE_VALID_DAYS = 30                 # v2.0: 本地缓存有效期（天）
+
+# v2.0: 渐进式轮询间隔（秒），最多轮询次数 = 列表长度
+PROGRESSIVE_INTERVALS = [10, 15, 20, 30, 45, 60, 60, 60]
 
 # 病毒常见载体文件扩展名（扫描目标）
 SCAN_EXTENSIONS = {
@@ -368,6 +374,49 @@ def should_scan(file_path: Path):
     return False
 
 
+# ========== v2.0: 本地扫描缓存 ==========
+
+def load_scan_cache():
+    """加载本地扫描缓存 {sha256: {filename, result, timestamp}}"""
+    if SCAN_CACHE_FILE.is_file():
+        try:
+            with open(SCAN_CACHE_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, IOError):
+            return {}
+    return {}
+
+def save_scan_cache(cache):
+    """保存扫描缓存到文件"""
+    with open(SCAN_CACHE_FILE, "w", encoding="utf-8") as f:
+        json.dump(cache, f, indent=2, ensure_ascii=False)
+
+def cache_get(sha256):
+    """查缓存，返回有效结果或 None"""
+    cache = load_scan_cache()
+    entry = cache.get(sha256)
+    if not entry:
+        return None
+    ts = entry.get("timestamp", 0)
+    age_days = (time.time() - ts) / 86400
+    if age_days > CACHE_VALID_DAYS:
+        # 过期，删除并返回 None
+        del cache[sha256]
+        save_scan_cache(cache)
+        return None
+    return entry.get("result")
+
+def cache_put(sha256, filename, result):
+    """写入缓存"""
+    cache = load_scan_cache()
+    cache[sha256] = {
+        "filename": filename,
+        "result": result,
+        "timestamp": time.time()
+    }
+    save_scan_cache(cache)
+
+
 def scan_folder(folder: Path):
     """遍历文件夹，收集待扫描文件"""
     files = []
@@ -432,21 +481,32 @@ def sort_by_priority(files):
     return files
 
 
-def vt_request(method, endpoint, api_key, key_mgr):
-    """发送 VirusTotal API 请求，自动处理限速、配额检查、自动切换。"""
-    ok, msg = key_mgr.check_quota()
-    if not ok:
-        # 全部耗尽 → 提示用户输入新 key
-        if "所有 Key" in msg or "Key 池为空" in msg:
-            if not key_mgr.prompt_new_key():
-                raise Exception(f"API 配额耗尽: {msg}")
-            api_key = key_mgr.current_key()
-        else:
-            raise Exception(f"API 配额异常: {msg}")
+# v2.0: 上次请求时间，用于精确限速（不浪费首请求 15s 空等）
+_last_request_time = 0.0
+
+def vt_request(method, endpoint, api_key, key_mgr, record_quota=True):
+    """发送 VirusTotal API 请求，自动处理限速、配额检查、自动切换。
+
+    record_quota=False: 免费操作（上传新文件、轮询新文件分析结果），不扣配额也不检查配额。
+    """
+    if record_quota:
+        ok, msg = key_mgr.check_quota()
+        if not ok:
+            if "所有 Key" in msg or "Key 池为空" in msg:
+                if not key_mgr.prompt_new_key():
+                    raise Exception(f"API 配额耗尽: {msg}")
+                api_key = key_mgr.current_key()
+            else:
+                raise Exception(f"API 配额异常: {msg}")
 
     headers = {"x-apikey": api_key, "Accept": "application/json"}
     url = f"{VT_API_BASE}{endpoint}"
-    time.sleep(RATE_LIMIT_INTERVAL)
+
+    # v2.0: 精确限速——距上次调用不足间隔才等待，不浪费首请求
+    global _last_request_time
+    elapsed = time.time() - _last_request_time
+    if elapsed < RATE_LIMIT_INTERVAL:
+        time.sleep(RATE_LIMIT_INTERVAL - elapsed)
 
     if method == "GET":
         resp = requests.get(url, headers=headers, timeout=30)
@@ -455,16 +515,44 @@ def vt_request(method, endpoint, api_key, key_mgr):
     else:
         raise ValueError(f"不支持的 HTTP 方法: {method}")
 
-    key_mgr.record_call()
+    _last_request_time = time.time()
+
+    if record_quota:
+        key_mgr.record_call()
     return resp
 
 
-def check_existing_report(api_key, sha256_hash, key_mgr):
-    """检查文件是否已有分析报告（通过 hash）"""
+# v2.0: 限速辅助函数（用于非 vt_request 的请求，如 upload_url POST）
+
+
+def _wait_rate_limit():
+    """等待满足限速间隔"""
+    global _last_request_time
+    elapsed = time.time() - _last_request_time
+    if elapsed < RATE_LIMIT_INTERVAL:
+        time.sleep(RATE_LIMIT_INTERVAL - elapsed)
+
+
+def _update_last_request_time():
+    """更新最后请求时间"""
+    global _last_request_time
+    _last_request_time = time.time()
+
+
+def check_existing_report(api_key, sha256_hash, key_mgr, filename=""):
+    """检查文件是否已有分析报告（先本地缓存，再 VT API）"""
+    # v2.0: 优先查本地缓存
+    cached = cache_get(sha256_hash)
+    if cached:
+        return cached
+
     try:
         resp = vt_request("GET", f"/files/{sha256_hash}", api_key, key_mgr)
         if resp.status_code == 200:
-            return resp.json()
+            data = resp.json()
+            # 写入缓存
+            cache_put(sha256_hash, filename, data)
+            return data
     except Exception:
         pass
     return None
@@ -475,7 +563,7 @@ def upload_file(api_key, file_path: Path, key_mgr):
     file_size = file_path.stat().st_size
 
     if file_size > MAX_FILE_SIZE:
-        resp = vt_request("GET", "/files/upload_url", api_key, key_mgr)
+        resp = vt_request("GET", "/files/upload_url", api_key, key_mgr, record_quota=False)
         resp.raise_for_status()
         upload_url = resp.json()["data"]
     else:
@@ -496,12 +584,11 @@ def upload_file(api_key, file_path: Path, key_mgr):
 
 
 def get_analysis(api_key, analysis_id, key_mgr):
-    """获取分析结果，支持轮询等待"""
-    max_retries = 30
-    for i in range(max_retries):
-        time.sleep(max(15, RATE_LIMIT_INTERVAL))
+    """获取分析结果，v2.0 渐进式轮询 + 免费调用"""
+    for i, interval in enumerate(PROGRESSIVE_INTERVALS):
+        time.sleep(interval)
         try:
-            resp = vt_request("GET", f"/analyses/{analysis_id}", api_key, key_mgr)
+            resp = vt_request("GET", f"/analyses/{analysis_id}", api_key, key_mgr, record_quota=False)
             if resp.status_code == 200:
                 data = resp.json()
                 status = data.get("data", {}).get("attributes", {}).get("status", "")
@@ -567,6 +654,7 @@ def generate_detection_reports(results, output_dir, timestamp):
             f"# 报毒文件报告",
             f"",
             f"- **File name**: {r['filename']}",
+            f"- **File path**: {r['filepath']}",
             f"- **SHA256**: {sha256}",
             f"- **VirusTotal link**: [{vt_link}]({vt_link})",
             f"",
@@ -589,6 +677,9 @@ def generate_html_report(results, source_desc, skipped_count):
     """生成 HTML 报告"""
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
+    # 恶意和可疑排在前面：先按恶意降序，再按可疑降序
+    results = sorted(results, key=lambda r: (-r.get("malicious", 0), -r.get("suspicious", 0)))
+
     rows = ""
     for r in results:
         filename = r["filename"]
@@ -600,41 +691,46 @@ def generate_html_report(results, source_desc, skipped_count):
         harmless = r.get("harmless", 0)
         total_engines = malicious + suspicious + undetected + harmless
 
-        if malicious > 0:
-            badge = "danger"
-            badge_text = f"恶意 {malicious}"
-        elif suspicious > 0:
-            badge = "warning"
-            badge_text = f"可疑 {suspicious}"
+        if malicious > 0 or suspicious > 0:
+            if malicious > 0 and suspicious > 0:
+                badge = "danger"
+                badge_text = f'<span class="badge danger">恶意 {malicious}</span> <span class="badge warning">可疑 {suspicious}</span>'
+            elif malicious > 0:
+                badge = "danger"
+                badge_text = f"恶意 {malicious}"
+            else:
+                badge = "warning"
+                badge_text = f"可疑 {suspicious}"
         else:
             badge = "safe"
             badge_text = "安全"
 
-        engine_details = ""
-        detections_list = ""  # 报毒详情
+        # 报毒详情
+        detections_list = ""
         engines = r.get("engines", {})
         if engines:
-            # 收集报毒引擎
             detections = []
             for ename, edata in sorted(engines.items()):
                 cat = edata.get("category", "")
                 threat = edata.get("result", "")
                 if cat in ("malicious", "suspicious"):
-                    detections.append(f'<span class="detect-item" title="{ename} 报毒: {threat}">{ename}: {threat}</span>')
-                eclass = "malicious" if cat == "malicious" else (
-                    "suspicious" if cat == "suspicious" else "clean"
-                )
-                engine_details += f'<span class="engine {eclass}" title="{threat}">{ename}</span>'
+                    detections.append(
+                        f'<span class="detect-item {cat}" title="{ename} 报毒: {threat}">{ename}: {threat}</span>'
+                    )
             detections_list = "".join(detections) if detections else "—"
+        else:
+            detections_list = "—"
+
+        vt_link = f"https://www.virustotal.com/gui/file/{sha256}"
 
         rows += f"""
         <tr class="{badge}">
-            <td class="filename" title="{filepath}">{filename}</td>
-            <td class="hash">{sha256[:16]}...</td>
+            <td class="filepath" title="{filepath}">{filepath}</td>
+            <td class="hash">{sha256}</td>
             <td><span class="badge {badge}">{badge_text}</span></td>
             <td>{malicious}/{total_engines}</td>
-            <td class="engines">{engine_details}</td>
             <td class="detections">{detections_list}</td>
+            <td class="vt-link"><a href="{vt_link}" target="_blank" title="在 VirusTotal 查看">查看</a></td>
         </tr>"""
 
     html = f"""<!DOCTYPE html>
@@ -663,19 +759,18 @@ def generate_html_report(results, source_desc, skipped_count):
     tr.danger {{ border-left: 4px solid #e74c3c; }}
     tr.warning {{ border-left: 4px solid #f39c12; }}
     tr.safe {{ border-left: 4px solid #27ae60; }}
-    .filename {{ max-width: 300px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
-    .hash {{ font-family: "Cascadia Code", monospace; font-size: 12px; color: #888; }}
+    .filepath {{ max-width: 400px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }}
+    .hash {{ font-family: "Cascadia Code", monospace; font-size: 11px; color: #888; word-break: break-all; }}
     .badge {{ display: inline-block; padding: 3px 10px; border-radius: 12px; font-size: 12px; font-weight: 600; }}
-    .badge.danger {{ background: #ffeaea; color: #c0392b; }}
-    .badge.warning {{ background: #fef5e7; color: #e67e22; }}
-    .badge.safe {{ background: #eafaf1; color: #27ae60; }}
-    .engines {{ display: flex; flex-wrap: wrap; gap: 4px; max-width: 500px; }}
-    .engines .engine {{ font-size: 10px; padding: 2px 6px; border-radius: 4px; cursor: default; }}
-    .engines .engine.malicious {{ background: #ffeaea; color: #c0392b; }}
-    .engines .engine.suspicious {{ background: #fef5e7; color: #e67e22; }}
-    .engines .engine.clean {{ background: #eafaf1; color: #27ae60; }}
+    .badge.danger {{ background: #f8d7da; color: #721c24; }}
+    .badge.warning {{ background: #fff3cd; color: #856404; }}
+    .badge.safe {{ background: #d4edda; color: #155724; }}
     .detections {{ display: flex; flex-wrap: wrap; gap: 4px; max-width: 400px; }}
-    .detect-item {{ font-size: 11px; padding: 3px 8px; border-radius: 4px; background: #ffeaea; color: #c0392b; border: 1px solid #f5c6cb; white-space: nowrap; }}
+    .detect-item {{ font-size: 11px; padding: 3px 8px; border-radius: 4px; white-space: nowrap; }}
+    .detect-item.malicious {{ background: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; }}
+    .detect-item.suspicious {{ background: #fff3cd; color: #856404; border: 1px solid #ffeeba; }}
+    .vt-link a {{ color: #3498db; text-decoration: none; font-size: 12px; font-weight: 500; }}
+    .vt-link a:hover {{ text-decoration: underline; }}
     .footer {{ text-align: center; margin-top: 20px; font-size: 12px; color: #999; }}
 </style>
 </head>
@@ -694,7 +789,7 @@ def generate_html_report(results, source_desc, skipped_count):
     </div>
     <table>
         <thead>
-            <tr><th>文件名</th><th>SHA-256</th><th>状态</th><th>检出率</th><th>全部引擎</th><th>报毒详情</th></tr>
+            <tr><th>文件路径</th><th>SHA-256</th><th>状态</th><th>检出率</th><th>报毒详情</th><th>VT链接</th></tr>
         </thead>
         <tbody>{rows}
         </tbody>
@@ -739,6 +834,8 @@ def parse_args():
                         help="要扫描的文件夹路径（不传则弹出 GUI 选择）")
     parser.add_argument("-p", "--path", nargs="+", default=None,
                         help="指定文件或文件夹路径（支持多个，文件直接扫描，文件夹递归扫描）")
+    parser.add_argument("--report-filter", default=None, metavar="SCAN_DATA_JSON",
+                        help="从已有 scan_data JSON 筛选报毒文件，生成仅含报毒项的 HTML 报告")
     return parser.parse_args()
 
 
@@ -771,6 +868,33 @@ def main():
         print(f"\n{msg}")
         if ok:
             print(key_mgr.list_keys())
+        return
+
+    # ----- 报告筛选命令 ----
+
+    if args.report_filter:
+        json_path = Path(args.report_filter)
+        if not json_path.is_file():
+            print(f"错误: 文件不存在 - {json_path}")
+            return
+        with open(json_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, list):
+            print("错误: JSON 格式不正确，应为数组")
+            return
+        filtered = [r for r in data if r.get("malicious", 0) > 0 or r.get("suspicious", 0) > 0]
+        if not filtered:
+            print("没有报毒或可疑文件。")
+            return
+
+        source = json_path.parent.parent.name if json_path.parent.parent != json_path.parent else json_path.parent.name
+        html = generate_html_report(filtered, f"{source}（仅报毒）", 0)
+        out_path = json_path.with_suffix("").with_suffix("")  # 去掉 .json
+        out_path = Path(str(out_path) + "_detections_only.html")
+        with open(out_path, "w", encoding="utf-8") as f:
+            f.write(html)
+        print(f"已生成报毒报告: {out_path}")
+        print(f"  共 {len(filtered)} 个文件（恶意: {sum(1 for r in filtered if r.get('malicious', 0) > 0)}，可疑: {sum(1 for r in filtered if r.get('malicious', 0) == 0 and r.get('suspicious', 0) > 0)}）")
         return
 
     # ----- 扫描流程 -----
@@ -851,12 +975,28 @@ def main():
     for i, f in enumerate(files, 1):
         size_kb = f.stat().st_size / 1024
         print(f"  {i:>3}. {f.name} ({size_kb:.1f} KB)")
-    print(f"\n预计耗时: 约 {len(files) * RATE_LIMIT_INTERVAL / 60:.1f} 分钟（含分析等待）")
+    print(f"\n预计耗时: 约 {len(files) * RATE_LIMIT_INTERVAL / 60:.1f} 分钟（仅报告查询，上传和轮询不计入 API 配额）")
     print(f"速率限制: {RATE_LIMIT_PER_MINUTE} 次/分钟  |  日配额: {DAILY_QUOTA} 次  |  月配额: {MONTHLY_QUOTA/1000:.0f}K 次\n")
 
-    # Step 4: 逐个扫描
+    # Step 4: 逐个扫描（实时更新报告）
     results = []
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    json_path = OUTPUT_DIR / f"scan_data_{timestamp}.json"
+    report_path = OUTPUT_DIR / f"scan_report_{timestamp}.html"
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    def _refresh_report():
+        """每扫完一个文件立即刷新报告，确保中断时不留空白"""
+        html = generate_html_report(results, source_desc, len(skipped_text))
+        with open(report_path, "w", encoding="utf-8") as f:
+            f.write(html)
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(results, f, indent=2, ensure_ascii=False)
+
+    def _record_result(result, msg=""):
+        results.append(result)
+        print(msg, flush=True)
+        _refresh_report()
 
     for i, file_path in enumerate(files, 1):
         api_key = key_mgr.current_key()
@@ -866,12 +1006,12 @@ def main():
             sha256 = file_sha256(file_path)
 
             # 先查已有报告
-            existing = check_existing_report(api_key, sha256, key_mgr)
+            existing = check_existing_report(api_key, sha256, key_mgr, file_path.name)
             if existing:
                 attrs = existing.get("data", {}).get("attributes", {})
                 stats = attrs.get("last_analysis_stats", {})
                 engines = attrs.get("last_analysis_results", {})
-                result = {
+                _record_result({
                     "filename": file_path.name, "filepath": str(file_path),
                     "sha256": sha256,
                     "malicious": stats.get("malicious", 0),
@@ -881,9 +1021,7 @@ def main():
                     "engines": {k: {"category": v.get("category", ""), "result": v.get("result", "")}
                                 for k, v in engines.items()},
                     "status": "existing_report",
-                }
-                results.append(result)
-                print(f"已有报告 → 恶意:{result['malicious']} 可疑:{result['suspicious']}")
+                }, f"已有报告 → 恶意:{stats.get('malicious', 0)} 可疑:{stats.get('suspicious', 0)}")
                 continue
 
             # 上传
@@ -891,7 +1029,11 @@ def main():
             upload_resp = upload_file(api_key, file_path, key_mgr)
             analysis_id = upload_resp.get("data", {}).get("id", "")
             if not analysis_id:
-                print("上传失败: 未获取到分析 ID")
+                _record_result({
+                    "filename": file_path.name, "filepath": str(file_path),
+                    "sha256": sha256, "malicious": 0, "suspicious": 0,
+                    "undetected": 0, "harmless": 0, "engines": {}, "status": "upload_failed",
+                }, "上传失败: 未获取到分析 ID")
                 continue
 
             # 等待分析
@@ -903,62 +1045,61 @@ def main():
                 attrs = analysis.get("data", {}).get("attributes", {})
                 stats = attrs.get("stats", {})
                 engines = attrs.get("results", {})
-                result = {
+                m = stats.get("malicious", 0)
+                s = stats.get("suspicious", 0)
+                flag = "!!" if m > 0 else ("?" if s > 0 else "OK")
+                _record_result({
                     "filename": file_path.name, "filepath": str(file_path),
                     "sha256": sha256,
-                    "malicious": stats.get("malicious", 0),
-                    "suspicious": stats.get("suspicious", 0),
+                    "malicious": m, "suspicious": s,
                     "undetected": stats.get("undetected", 0),
                     "harmless": stats.get("harmless", 0),
                     "engines": {k: {"category": v.get("category", ""), "result": v.get("result", "")}
                                 for k, v in engines.items()},
                     "status": "scanned",
-                }
-                results.append(result)
-                flag = "!!" if result["malicious"] > 0 else ("?" if result["suspicious"] > 0 else "OK")
-                print(f" → {flag} 恶意:{result['malicious']} 可疑:{result['suspicious']}")
+                }, f"→ {flag} 恶意:{m} 可疑:{s}")
             else:
-                results.append({
+                _record_result({
                     "filename": file_path.name, "filepath": str(file_path),
                     "sha256": sha256, "malicious": 0, "suspicious": 0,
                     "undetected": 0, "harmless": 0, "engines": {}, "status": "timeout",
-                })
-                print("→ 分析超时")
+                }, "→ 分析超时")
 
         except Exception as e:
             err_msg = str(e)
-            results.append({
+            if "配额耗尽" in err_msg:
+                _record_result({
+                    "filename": file_path.name, "filepath": str(file_path),
+                    "sha256": sha256 if 'sha256' in dir() else "", "malicious": 0, "suspicious": 0,
+                    "undetected": 0, "harmless": 0, "engines": {},
+                    "status": "quota_exhausted",
+                })
+                print(f"\n\n  === 配额耗尽，扫描中断 ===")
+                print(f"  已扫描: {len(results)}/{len(files)} 个文件")
+                remaining = len(files) - i
+                if remaining > 0:
+                    print(f"  未扫描: {remaining} 个文件")
+                break
+            _record_result({
                 "filename": file_path.name, "filepath": str(file_path),
-                "sha256": "", "malicious": 0, "suspicious": 0,
-                "undetected": 0, "harmless": 0, "engines": {}, "status": f"error",
-            })
-            print(f"→ 错误: {err_msg}")
+                "sha256": sha256 if 'sha256' in dir() else "", "malicious": 0, "suspicious": 0,
+                "undetected": 0, "harmless": 0, "engines": {}, "status": "error",
+            }, f"→ 错误: {err_msg}")
 
-    # Step 5: 生成报告
-    print("\n[生成报告] ...")
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    # Step 5: 生成报毒详情（报告已在 Step 4 中实时更新）
+    print("\n[生成报毒详情] ...")
 
-    # 为报毒文件生成独立 JSON + MD
     det_dir, det_count = generate_detection_reports(results, OUTPUT_DIR, timestamp)
-    if det_count > 0:
-        print(f"  报毒文件详情: {det_count} 个 → {det_dir}")
 
-    html = generate_html_report(results, source_desc, len(skipped_text))
-
-    report_path = OUTPUT_DIR / f"scan_report_{timestamp}.html"
-    with open(report_path, "w", encoding="utf-8") as f:
-        f.write(html)
-
-    json_path = OUTPUT_DIR / f"scan_data_{timestamp}.json"
-    with open(json_path, "w", encoding="utf-8") as f:
-        json.dump(results, f, indent=2, ensure_ascii=False)
-
+    completed = len(results) >= len(files)
     print(f"\n{'=' * 60}")
-    print(f"  扫描完成！")
-    print(f"  总文件数: {len(files)}")
+    print(f"  {'扫描完成！' if completed else '扫描中断（配额耗尽）'}")
+    print(f"  已扫描: {len(results)}/{len(files)} 个文件")
     print(f"  恶意文件: {sum(1 for r in results if r.get('malicious', 0) > 0)}")
     print(f"  可疑文件: {sum(1 for r in results if r.get('malicious', 0) == 0 and r.get('suspicious', 0) > 0)}")
     print(f"  安全文件: {sum(1 for r in results if r.get('malicious', 0) == 0 and r.get('suspicious', 0) == 0)}")
+    if not completed:
+        print(f"  未扫描: {len(files) - len(results)} 个（添加 Key 后重跑可续扫）")
     print(f"  ─────────────────────────────")
     print(f"  {key_mgr.quota_status()}")
     print(f"  HTML 报告: {report_path}")
