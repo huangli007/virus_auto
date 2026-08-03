@@ -42,6 +42,14 @@ import threading
 from datetime import datetime
 from pathlib import Path
 
+# ===== ANSI 终端颜色 =====
+RED = "\033[91m"
+YELLOW = "\033[93m"
+GREEN = "\033[92m"
+CYAN = "\033[96m"
+BOLD = "\033[1m"
+RESET = "\033[0m"
+
 try:
     import requests
 except ImportError:
@@ -54,6 +62,7 @@ except ImportError:
 CONFIG_DIR = Path(__file__).parent
 CONFIG_FILE = CONFIG_DIR / "virus_scanner_config.json"
 SCAN_CACHE_FILE = CONFIG_DIR / "scan_cache.json"     # v3.0: 本地扫描缓存（SHA-256 索引）
+DECLARED_CACHE_FILE = CONFIG_DIR / "declared_cache.json"  # v3.0: 已申诉记录（SHA256|引擎 索引）
 PROJECTS_DIR = CONFIG_DIR / "projects"                # v3.0: 项目目录
 
 VT_API_BASE = "https://www.virustotal.com/api/v3"
@@ -496,6 +505,68 @@ def cache_stats():
     last = max((e.get("last_scanned", "") for e in cache.values()), default="")
     return (f"缓存条目: {len(cache)} 个\n"
             f"最近扫描: {last}")
+
+
+# ========== v3.0: 已申诉记录缓存（SHA256+引擎维度去重）==========
+def load_declared_cache():
+    """加载已申诉记录 {sha256|engine_name: {file_path, declared_at, project}}"""
+    if DECLARED_CACHE_FILE.is_file():
+        try:
+            with open(DECLARED_CACHE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data.get("declared", {}) if isinstance(data, dict) else {}
+        except (json.JSONDecodeError, IOError):
+            return {}
+    return {}
+
+
+def save_declared_cache(declared_data):
+    """保存已申诉记录"""
+    payload = {
+        "version": "1.0",
+        "total": len(declared_data),
+        "declared": declared_data,
+    }
+    with open(DECLARED_CACHE_FILE, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False)
+
+
+def is_declared(sha256, engine_name):
+    """检查某一文件的某引擎申诉记录是否已存在。返回 True/False"""
+    key = f"{sha256}|{engine_name}"
+    cache = load_declared_cache()
+    return key in cache
+
+
+def mark_declared(sha256, engine_name, file_path, project=""):
+    """标记某一文件的某引擎申诉记录已完成"""
+    key = f"{sha256}|{engine_name}"
+    cache = load_declared_cache()
+    cache[key] = {
+        "sha256": sha256,
+        "engine": engine_name,
+        "file_path": file_path,
+        "declared_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "project": project,
+    }
+    save_declared_cache(cache)
+
+
+def clear_declared_cache():
+    """清空已申诉记录"""
+    if DECLARED_CACHE_FILE.exists():
+        DECLARED_CACHE_FILE.unlink()
+    return True
+
+
+def declared_stats():
+    """返回已申诉记录统计"""
+    cache = load_declared_cache()
+    if not cache:
+        return "已申诉记录为空。"
+    last = max((e.get("declared_at", "") for e in cache.values()), default="")
+    return (f"已申诉条目: {len(cache)} 个\n"
+            f"最近申诉: {last}")
 
 
 def export_excel(json_path, output_path):
@@ -1149,28 +1220,36 @@ def main():
             print("没有报毒文件。")
             return
 
-        print(f"\n报毒文件测试报告（{len(detections_list)} 个文件）")
+        print(f"\n{BOLD}报毒文件测试报告（{len(detections_list)} 个文件）{RESET}")
         print("=" * 70)
 
         for idx, r in enumerate(detections_list, 1):
             fp = r.get("filepath", r.get("filename", "?"))
             sha = r.get("sha256", "?")
             engines = r.get("engines", {})
-            det = [(ename, info.get("result", info.get("category", "?")))
+            det = [(ename, info.get("result", info.get("category", "?")),
+                    info.get("category", "?"))
                    for ename, info in engines.items()
                    if info.get("category") in ("malicious", "suspicious")]
 
-            print(f"\n  [{idx}] {fp}")
-            print(f"      SHA256: {sha}")
-            print(f"      恶意: {r.get('malicious', 0)}  可疑: {r.get('suspicious', 0)}")
-            for ename, threat in det:
-                cat = engines[ename].get("category", "?")
-                tag = "M" if cat == "malicious" else "S"
-                print(f"      [{tag}] {ename}: {threat}")
+            m = r.get("malicious", 0)
+            s = r.get("suspicious", 0)
+            color = RED if m > 0 else YELLOW
 
+            print(f"\n  {color}{BOLD}[{idx}] {fp}{RESET}")
+            print(f"      SHA256: {sha}")
+            print(f"      {RED}恶意: {m}{RESET}  {YELLOW}可疑: {s}{RESET}")
+            for ename, threat, cat in det:
+                if cat == "malicious":
+                    tag = f"{RED}[M]{RESET}"
+                else:
+                    tag = f"{YELLOW}[S]{RESET}"
+                print(f"      {tag} {ename}: {threat}")
+
+        m_cnt = sum(1 for r in detections_list if r.get("malicious", 0) > 0)
+        s_cnt = sum(1 for r in detections_list if r.get("malicious", 0) == 0 and r.get("suspicious", 0) > 0)
         print(f"\n{'=' * 70}")
-        print(f"  合计: {sum(1 for r in detections_list if r.get('malicious', 0) > 0)} 恶意, "
-              f"{sum(1 for r in detections_list if r.get('malicious', 0) == 0 and r.get('suspicious', 0) > 0)} 可疑")
+        print(f"  {BOLD}合计: {RED}{m_cnt} 恶意{RESET}{BOLD}, {YELLOW}{s_cnt} 可疑{RESET}")
         return
 
     # ----- 生成申诉邮件命令 ----
@@ -1274,6 +1353,23 @@ def main():
             print("没有可生成的邮件（所有引擎均无邮箱联系方式）。")
             return
 
+        # v3.0: 过滤已申诉记录，避免重复发送
+        skipped_declared = 0
+        filtered_queue = []
+        for em in email_queue:
+            if is_declared(em["sha256"], em["engine"]):
+                skipped_declared += 1
+            else:
+                filtered_queue.append(em)
+
+        if skipped_declared > 0:
+            print(f"\n📌 跳过 {skipped_declared} 条已申诉记录（declared_cache.json）\n")
+        email_queue = filtered_queue
+
+        if not email_queue:
+            print("所有报毒引擎均已申诉过，无需重复发送。")
+            return
+
         print(f"\n共 {len(email_queue)} 封待确认邮件：\n")
 
         confirmed = []
@@ -1339,7 +1435,12 @@ def main():
             # SMTP 发送
             subject = f"False Positive Report - {em['engine']} - {em['file_name']}"
             ok, err = gfe.send_fp_email(em["recipient"], subject, em["body"])
-            status = "已发送" if ok else f"失败: {err}"
+            if ok:
+                mark_declared(em["sha256"], em["engine"], em["file_path"],
+                              project=target.parent.name)
+                status = "已发送"
+            else:
+                status = f"失败: {err}"
             send_results.append({**em, "status": status})
             print(f"  [{em['engine']}] {status}")
 
@@ -1509,7 +1610,11 @@ def main():
             "undetected": 0, "harmless": 0, "engines": {},
             "status": "cached",
         })
-        print(f"  [缓存] {file_path.name} → 恶意:{entry.get('malicious', 0)} 可疑:{entry.get('suspicious', 0)}")
+        m = entry.get("malicious", 0)
+        s = entry.get("suspicious", 0)
+        color = RED if m > 0 else (YELLOW if s > 0 else "")
+        rcol = RESET if color else ""
+        print(f"  [缓存] {file_path.name} → {color}恶意:{m} 可疑:{s}{rcol}")
 
     _refresh_report()
 
@@ -1541,7 +1646,9 @@ def main():
                         "undetected": 0, "harmless": 0, "engines": {},
                         "status": "cached",
                     })
-                    print(f"→ 缓存 恶意:{m} 可疑:{s}")
+                    color = RED if m > 0 else (YELLOW if s > 0 else "")
+                    rcol = RESET if color else ""
+                    print(f"→ 缓存 {color}恶意:{m} 可疑:{s}{rcol}")
                 else:
                     # VT API 返回的已有报告
                     attrs = existing.get("data", {}).get("attributes", {})
@@ -1560,7 +1667,9 @@ def main():
                                     for k, v in engines.items()},
                         "status": "existing_report",
                     })
-                    print(f"→ 已有报告 恶意:{m} 可疑:{s}")
+                    color = RED if m > 0 else (YELLOW if s > 0 else "")
+                    rcol = RESET if color else ""
+                    print(f"→ 已有报告 {color}恶意:{m} 可疑:{s}{rcol}")
                 continue
 
             # 上传
@@ -1588,7 +1697,10 @@ def main():
                 m = stats.get("malicious", 0)
                 s = stats.get("suspicious", 0)
                 cache_put(sha256, str(file_path), file_path.name, project_rel, m, s)
-                flag = "!!" if m > 0 else ("?" if s > 0 else "OK")
+                flag = RED + "!!" if m > 0 else (YELLOW + "?" if s > 0 else GREEN + "OK")
+                flag += RESET
+                color = RED if m > 0 else (YELLOW if s > 0 else "")
+                rcol = RESET if color else ""
                 _record_result({
                     "filename": file_path.name, "filepath": str(file_path),
                     "sha256": sha256,
@@ -1599,7 +1711,7 @@ def main():
                                 for k, v in engines.items()},
                     "status": "scanned",
                 })
-                print(f"→ {flag} 恶意:{m} 可疑:{s}")
+                print(f"→ {flag} {color}恶意:{m} 可疑:{s}{rcol}")
             else:
                 _record_result({
                     "filename": file_path.name, "filepath": str(file_path),
@@ -1639,9 +1751,9 @@ def main():
     print(f"\n{'=' * 60}")
     print(f"  {'扫描完成！' if completed else '扫描中断（配额耗尽）'}")
     print(f"  总计: {len(files)} 个文件  |  缓存复用: {skipped_scan}  |  本次扫描: {len(results)}")
-    print(f"  恶意: {sum(1 for r in all_results if r.get('malicious', 0) > 0)}")
-    print(f"  可疑: {sum(1 for r in all_results if r.get('malicious', 0) == 0 and r.get('suspicious', 0) > 0)}")
-    print(f"  安全: {sum(1 for r in all_results if r.get('malicious', 0) == 0 and r.get('suspicious', 0) == 0)}")
+    print(f"  {RED}恶意: {sum(1 for r in all_results if r.get('malicious', 0) > 0)}{RESET}")
+    print(f"  {YELLOW}可疑: {sum(1 for r in all_results if r.get('malicious', 0) == 0 and r.get('suspicious', 0) > 0)}{RESET}")
+    print(f"  {GREEN}安全: {sum(1 for r in all_results if r.get('malicious', 0) == 0 and r.get('suspicious', 0) == 0)}{RESET}")
     print(f"  ─────────────────────────────")
     print(f"  {key_mgr.quota_status()}")
     print(f"  项目目录: {output_dir}")
