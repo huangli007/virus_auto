@@ -231,8 +231,59 @@ def send_fp_email(recipient, subject, body, attachment_path=None):
         return False, str(e)
 
 
-def generate_email(file_name, sha256, vt_link, engine, threat):
-    """按模板生成邮件正文。无邮箱时返回 None"""
+# ========== GitHub 误报仓库上传 ==========
+FP_REPO_DIR = Path(__file__).parent.parent / "False-Positive-Report"
+FP_REPO_URL = "https://github.com/huangli007/False-Positive-Report"
+
+
+def upload_to_github(file_path, project_name):
+    """将报毒文件上传到 GitHub 误报仓库，返回 GitHub 文件 URL 或 None"""
+    import shutil
+    import subprocess
+
+    src = Path(file_path)
+    if not src.is_file():
+        return None
+
+    if not FP_REPO_DIR.is_dir():
+        return None
+
+    # 目标目录: repo/project_name/
+    dest_dir = FP_REPO_DIR / project_name
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest = dest_dir / src.name
+
+    # 避免同名覆盖：加序号
+    if dest.exists():
+        stem, suffix = dest.stem, dest.suffix
+        i = 1
+        while dest.exists():
+            dest = dest_dir / f"{stem}_{i}{suffix}"
+            i += 1
+
+    shutil.copy2(src, dest)
+
+    try:
+        subprocess.run(["git", "pull", "--rebase"], cwd=FP_REPO_DIR,
+                       capture_output=True, text=True, timeout=30)
+        subprocess.run(["git", "add", str(dest.relative_to(FP_REPO_DIR))], cwd=FP_REPO_DIR,
+                       capture_output=True, text=True, timeout=10)
+        commit_msg = f"Add {project_name}/{dest.name}"
+        subprocess.run(["git", "commit", "-m", commit_msg], cwd=FP_REPO_DIR,
+                       capture_output=True, text=True, timeout=10)
+        subprocess.run(["git", "push"], cwd=FP_REPO_DIR,
+                       capture_output=True, text=True, timeout=60)
+    except Exception:
+        return None
+
+    # 构造 GitHub raw URL
+    branch = "main"
+    rel = dest.relative_to(FP_REPO_DIR).as_posix()
+    return f"{FP_REPO_URL}/blob/{branch}/{rel}"
+
+
+def generate_email(file_name, sha256, vt_link, engine, threat, github_link=None):
+    """按模板生成邮件正文，可选 GitHub 链接。无邮箱时返回 None"""
     contact = VENDOR_CONTACTS.get(engine, "")
     if not contact or contact.startswith("http"):
         return None, contact or "(未找到联系方式)"
@@ -245,7 +296,15 @@ def generate_email(file_name, sha256, vt_link, engine, threat):
 4. Detection engine: {engine}
 5. Detection name: {threat}
 
-This file is a false alarm file. It contains no malicious behavior. Please verify and correct this false alarm in your signature/database. Thank you for your support.
+This file is a false alarm file. It contains no malicious behavior. Please verify and correct this false alarm in your signature/database. Thank you for your support."""
+
+    if github_link:
+        body += f"""
+
+Sample file has been uploaded to our GitHub repository for your convenience:
+{github_link}"""
+
+    body += f"""
 
 BR,
 {SENDER_NAME}

@@ -1283,18 +1283,28 @@ def main():
 
             print(f"从 {target.name} 筛选出 {len(detections_data)} 个报毒文件\n")
 
+            uploaded_files = {}  # file_path → github_link
+            project_name = target.parent.name
             for r in detections_data:
                 file_name = r.get("filename", "?")
                 file_path = r.get("filepath", file_name)
                 sha256 = r.get("sha256", "")
                 vt_link = f"https://www.virustotal.com/gui/file/{sha256}" if sha256 else ""
+
+                # 每个文件只上传一次到 GitHub
+                if file_path not in uploaded_files:
+                    github_link = gfe.upload_to_github(file_path, project_name)
+                    uploaded_files[file_path] = github_link
+
                 engines = r.get("engines", {})
                 for ename, info in engines.items():
                     cat = info.get("category", "")
                     if cat not in ("malicious", "suspicious"):
                         continue
                     threat = info.get("result", info.get("category", "?"))
-                    body, recipient = gfe.generate_email(file_name, sha256, vt_link, ename, threat)
+                    body, recipient = gfe.generate_email(
+                        file_name, sha256, vt_link, ename, threat,
+                        github_link=uploaded_files[file_path])
                     if body is None:
                         continue
                     email_queue.append({
@@ -1318,6 +1328,8 @@ def main():
                 print(f"错误: 目录下没有 JSON 文件 - {target}")
                 return
 
+            uploaded_files = {}  # file_path → github_link
+            project_name = target.parent.name
             for jf in json_files:
                 with open(jf, "r", encoding="utf-8") as f:
                     data = json.load(f)
@@ -1325,10 +1337,17 @@ def main():
                 file_path = data.get("file_path", file_name)
                 sha256 = data.get("sha256", "")
                 vt_link = data.get("virus_total_link", "")
+
+                # 每个文件只上传一次到 GitHub
+                if file_path not in uploaded_files:
+                    github_link = gfe.upload_to_github(file_path, project_name)
+                    uploaded_files[file_path] = github_link
+
                 for det in data.get("detections", []):
                     engine = det.get("engine", "Unknown")
                     threat = det.get("name", "Unknown")
-                    body, recipient = gfe.generate_email(file_name, sha256, vt_link, engine, threat)
+                    body, recipient = gfe.generate_email(file_name, sha256, vt_link, engine, threat,
+                                                         github_link=uploaded_files[file_path])
                     if body is None:
                         print(f"  [{engine}] 跳过 (无邮箱)")
                         continue
