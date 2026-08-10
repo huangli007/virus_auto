@@ -234,19 +234,52 @@ def send_fp_email(recipient, subject, body, attachment_path=None):
 # ========== GitHub 误报仓库上传 ==========
 FP_REPO_DIR = Path(__file__).parent.parent / "False-Positive-Report"
 FP_REPO_URL = "https://github.com/huangli007/False-Positive-Report"
+FP_MANIFEST_FILE = FP_REPO_DIR / "manifest.json"
+
+
+def _file_sha256(file_path):
+    """计算文件 SHA-256"""
+    import hashlib
+    h = hashlib.sha256()
+    with open(file_path, "rb") as f:
+        for chunk in iter(lambda: f.read(8192), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _load_manifest():
+    """加载上传清单，返回 dict: sha256 → 'project/filename'"""
+    if FP_MANIFEST_FILE.exists():
+        with open(FP_MANIFEST_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {}
+
+
+def _save_manifest(manifest):
+    """保存上传清单"""
+    FP_MANIFEST_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with open(FP_MANIFEST_FILE, "w", encoding="utf-8") as f:
+        json.dump(manifest, f, indent=2, ensure_ascii=False)
 
 
 def upload_to_github(file_path, project_name):
-    """将报毒文件上传到 GitHub 误报仓库，返回 GitHub 文件 URL 或 None"""
+    """将报毒文件上传到 GitHub 误报仓库（SHA-256 去重）。返回 GitHub 文件 URL 或 None"""
     import shutil
     import subprocess
 
     src = Path(file_path)
     if not src.is_file():
         return None
-
     if not FP_REPO_DIR.is_dir():
         return None
+
+    sha = _file_sha256(src)
+    manifest = _load_manifest()
+
+    # 已上传过 → 直接返回已有 URL
+    if sha in manifest:
+        rel = manifest[sha]
+        return f"{FP_REPO_URL}/blob/main/{rel}"
 
     # 目标目录: repo/project_name/
     dest_dir = FP_REPO_DIR / project_name
@@ -263,12 +296,18 @@ def upload_to_github(file_path, project_name):
 
     shutil.copy2(src, dest)
 
+    # 记录到清单
+    rel_path = dest.relative_to(FP_REPO_DIR).as_posix()
+    manifest[sha] = rel_path
+    _save_manifest(manifest)
+
     try:
         subprocess.run(["git", "pull", "--rebase"], cwd=FP_REPO_DIR,
                        capture_output=True, text=True, timeout=30)
-        subprocess.run(["git", "add", str(dest.relative_to(FP_REPO_DIR))], cwd=FP_REPO_DIR,
+        subprocess.run(["git", "add", str(dest.relative_to(FP_REPO_DIR)),
+                        "manifest.json"], cwd=FP_REPO_DIR,
                        capture_output=True, text=True, timeout=10)
-        commit_msg = f"Add {project_name}/{dest.name}"
+        commit_msg = f"Add {rel_path}"
         subprocess.run(["git", "commit", "-m", commit_msg], cwd=FP_REPO_DIR,
                        capture_output=True, text=True, timeout=10)
         subprocess.run(["git", "push"], cwd=FP_REPO_DIR,
@@ -276,10 +315,7 @@ def upload_to_github(file_path, project_name):
     except Exception:
         return None
 
-    # 构造 GitHub raw URL
-    branch = "main"
-    rel = dest.relative_to(FP_REPO_DIR).as_posix()
-    return f"{FP_REPO_URL}/blob/{branch}/{rel}"
+    return f"{FP_REPO_URL}/blob/main/{rel_path}"
 
 
 def generate_email(file_name, sha256, vt_link, engine, threat, github_link=None):
