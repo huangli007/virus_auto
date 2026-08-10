@@ -1434,7 +1434,11 @@ def main():
 
             # SMTP 发送
             subject = f"False Positive Report - {em['engine']} - {em['file_name']}"
-            ok, err = gfe.send_fp_email(em["recipient"], subject, em["body"])
+            attach = em["file_path"]
+            if not Path(attach).is_file():
+                print(f"  ⚠ 附件不存在: {attach}")
+            ok, err = gfe.send_fp_email(em["recipient"], subject, em["body"],
+                                          attachment_path=attach)
             if ok:
                 mark_declared(em["sha256"], em["engine"], em["file_path"],
                               project=target.parent.name)

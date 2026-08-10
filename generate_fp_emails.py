@@ -184,17 +184,34 @@ def save_smtp_config(config):
         json.dump(config, f, indent=2, ensure_ascii=False)
 
 
-def send_fp_email(recipient, subject, body):
-    """通过 SMTP 发送误报申诉邮件，返回 (成功, 错误信息)"""
+def send_fp_email(recipient, subject, body, attachment_path=None):
+    """通过 SMTP 发送误报申诉邮件，可选附件。返回 (成功, 错误信息)"""
     import smtplib
     from email.mime.text import MIMEText
+    from email.mime.multipart import MIMEMultipart
+    from email.mime.base import MIMEBase
+    from email import encoders
 
     config = load_smtp_config()
     auth_code = config.get("auth_code", "")
     if not auth_code:
         return False, "SMTP 授权码未配置"
 
-    msg = MIMEText(body, "plain", "utf-8")
+    if attachment_path and Path(attachment_path).is_file():
+        msg = MIMEMultipart()
+        msg.attach(MIMEText(body, "plain", "utf-8"))
+        with open(attachment_path, "rb") as af:
+            part = MIMEBase("application", "octet-stream")
+            part.set_payload(af.read())
+            encoders.encode_base64(part)
+            part.add_header(
+                "Content-Disposition",
+                f'attachment; filename="{Path(attachment_path).name}"'
+            )
+            msg.attach(part)
+    else:
+        msg = MIMEText(body, "plain", "utf-8")
+
     msg["From"] = SENDER_EMAIL
     msg["To"] = recipient
     msg["Subject"] = subject
