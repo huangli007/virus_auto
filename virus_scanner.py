@@ -77,6 +77,11 @@ EST_CALLS_PER_FILE = 1                # v2.0: 仅查报告扣配额，上传和�
 # v2.0: 渐进式轮询间隔
 PROGRESSIVE_INTERVALS = [10, 15, 20, 30, 45, 60, 60, 60]
 
+# 所有 API Key 均 429 限速时抛出，触发扫毒终止
+class AllKeysExhaustedError(Exception):
+    """所有可用 API Key 均已触发 429 限速，扫描无法继续"""
+    pass
+
 # 病毒常见载体文件扩展名（扫描目标）
 SCAN_EXTENSIONS = {
     ".exe", ".dll", ".sys", ".bat", ".cmd", ".ps1", ".vbs", ".vbe",
@@ -804,12 +809,12 @@ def vt_request(method, endpoint, api_key, key_mgr, record_quota=True):
                 retry_count = 0
                 continue
             else:
-                print(f"  [密钥耗尽] [{old_label}] 3次重试仍限速，且无其他可用 key，跳过此文件", flush=True)
-                break
+                print(f"\n  [密钥耗尽] 所有 {len(key_mgr.keys)} 个 Key 均触发 429 限速，终止扫描", flush=True)
+                raise AllKeysExhaustedError("所有 API Key 均已限速")
 
         if retry_count >= 3:
-            print(f"  [重试耗尽] 当前 key 3次重试仍 429，单 key 模式下跳过此文件", flush=True)
-            break
+            print(f"\n  [重试耗尽] 当前 key 3次重试仍 429，单 key 模式下终止扫描", flush=True)
+            raise AllKeysExhaustedError("API Key 持续限速")
 
     if record_quota:
         key_mgr.record_call()
@@ -903,12 +908,12 @@ def upload_file(api_key, file_path: Path, key_mgr):
                 retry_count = 0
                 continue
             else:
-                print(f"  [密钥耗尽] [{old_label}] 3次重试仍限速，且无其他可用 key，跳过此文件", flush=True)
-                break
+                print(f"\n  [密钥耗尽] 所有 {len(key_mgr.keys)} 个 Key 均触发 429 限速，终止扫描", flush=True)
+                raise AllKeysExhaustedError("所有 API Key 均已限速")
 
         if retry_count >= 3:
-            print(f"  [重试耗尽] 当前 key 3次重试仍 429，单 key 模式下跳过此文件", flush=True)
-            break
+            print(f"\n  [重试耗尽] 当前 key 3次重试仍 429，单 key 模式下终止扫描", flush=True)
+            raise AllKeysExhaustedError("API Key 持续限速")
 
     if resp.status_code == 200:
         return resp.json()
@@ -1791,6 +1796,16 @@ def main():
                 })
                 print("→ 分析超时")
 
+        except AllKeysExhaustedError:
+            _record_result({
+                "filename": file_path.name, "filepath": str(file_path),
+                "sha256": sha, "malicious": 0, "suspicious": 0,
+                "undetected": 0, "harmless": 0, "engines": {},
+                "status": "rate_limited",
+            })
+            print(f"\n\n  === 所有 API Key 均触发 429 限速，扫描终止 ===")
+            print(f"  已扫描: {len(results)}/{len(new_files)} 个文件（不含缓存）")
+            break
         except Exception as e:
             err_msg = str(e)
             if "配额耗尽" in err_msg:
@@ -1818,9 +1833,20 @@ def main():
 
     completed = len(all_results) >= len(files)
     skipped_scan = len(skip_results)
+    rate_limited = any(r.get("status") == "rate_limited" for r in all_results)
+    quota_hit = any(r.get("status") == "quota_exhausted" for r in all_results)
+
+    if rate_limited:
+        status_line = "扫描中断（所有 Key 429 限速）"
+    elif quota_hit:
+        status_line = "扫描中断（配额耗尽）"
+    elif completed:
+        status_line = "扫描完成！"
+    else:
+        status_line = "扫描中断"
 
     print(f"\n{'=' * 60}")
-    print(f"  {'扫描完成！' if completed else '扫描中断（配额耗尽）'}")
+    print(f"  {status_line}")
     print(f"  总计: {len(files)} 个文件  |  缓存复用: {skipped_scan}  |  本次扫描: {len(results)}")
     print(f"  {RED}恶意: {sum(1 for r in all_results if r.get('malicious', 0) > 0)}{RESET}")
     print(f"  {YELLOW}可疑: {sum(1 for r in all_results if r.get('malicious', 0) == 0 and r.get('suspicious', 0) > 0)}{RESET}")
