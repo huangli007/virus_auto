@@ -771,18 +771,45 @@ def vt_request(method, endpoint, api_key, key_mgr, record_quota=True):
 
     _last_request_time = time.time()
 
-    # HTTP 429 限速重试（最多 3 次，指数退避）
+    # HTTP 429 限速重试：每个 key 最多 3 次，耗尽后切换下一个 key
     retry_count = 0
-    while resp.status_code == 429 and retry_count < 3:
+    attempted_keys = {api_key}
+
+    while resp.status_code == 429 and len(attempted_keys) < len(key_mgr.keys) + 1:
         retry_count += 1
         wait = 60 * retry_count
-        print(f"\n  [HTTP 429] 请求限速，等待 {wait}s 后重试 ({retry_count}/3)...", flush=True)
+        label = key_mgr.current_label()
+        print(f"\n  [HTTP 429] Key [{label}] 限速，等待 {wait}s 后重试 ({retry_count}/3)...", flush=True)
         time.sleep(wait)
         _last_request_time = time.time()
+
         if method == "GET":
             resp = requests.get(url, headers=headers, timeout=30)
         else:
             resp = requests.post(url, headers=headers, timeout=60)
+
+        if resp.status_code != 429:
+            break  # 成功
+
+        # 当前 key 已重试 3 次仍然 429 → 切换 key
+        if retry_count >= 3 and len(key_mgr.keys) > 1:
+            old_label = key_mgr.current_label()
+            switched = key_mgr._switch_to_next_available()
+            if switched:
+                new_label = key_mgr.current_label()
+                print(f"  [密钥切换] [{old_label}] 3次重试仍限速 → 切换到 [{new_label}]", flush=True)
+                api_key = key_mgr.current_key()
+                headers = {"x-apikey": api_key, "Accept": "application/json"}
+                attempted_keys.add(api_key)
+                retry_count = 0
+                continue
+            else:
+                print(f"  [密钥耗尽] [{old_label}] 3次重试仍限速，且无其他可用 key，跳过此文件", flush=True)
+                break
+
+        if retry_count >= 3:
+            print(f"  [重试耗尽] 当前 key 3次重试仍 429，单 key 模式下跳过此文件", flush=True)
+            break
 
     if record_quota:
         key_mgr.record_call()
@@ -842,12 +869,15 @@ def upload_file(api_key, file_path: Path, key_mgr):
             timeout=120,
         )
 
-    # HTTP 429 限速重试（最多 3 次，指数退避）
+    # HTTP 429 限速重试：每个 key 最多 3 次，耗尽后切换下一个 key
     retry_count = 0
-    while resp.status_code == 429 and retry_count < 3:
+    attempted_keys = {api_key}
+
+    while resp.status_code == 429 and len(attempted_keys) < len(key_mgr.keys) + 1:
         retry_count += 1
         wait = 60 * retry_count
-        print(f"\n  [HTTP 429] 上传限速，等待 {wait}s 后重试 ({retry_count}/3)...", flush=True)
+        label = key_mgr.current_label()
+        print(f"\n  [HTTP 429] Key [{label}] 上传限速，等待 {wait}s 后重试 ({retry_count}/3)...", flush=True)
         time.sleep(wait)
         _update_last_request_time()
         with open(file_path, "rb") as f:
@@ -857,6 +887,28 @@ def upload_file(api_key, file_path: Path, key_mgr):
                 files={"file": (file_path.name, f)},
                 timeout=120,
             )
+
+        if resp.status_code != 429:
+            break  # 成功
+
+        # 当前 key 已重试 3 次仍然 429 → 切换 key
+        if retry_count >= 3 and len(key_mgr.keys) > 1:
+            old_label = key_mgr.current_label()
+            switched = key_mgr._switch_to_next_available()
+            if switched:
+                new_label = key_mgr.current_label()
+                print(f"  [密钥切换] [{old_label}] 3次重试仍限速 → 切换到 [{new_label}]", flush=True)
+                api_key = key_mgr.current_key()
+                attempted_keys.add(api_key)
+                retry_count = 0
+                continue
+            else:
+                print(f"  [密钥耗尽] [{old_label}] 3次重试仍限速，且无其他可用 key，跳过此文件", flush=True)
+                break
+
+        if retry_count >= 3:
+            print(f"  [重试耗尽] 当前 key 3次重试仍 429，单 key 模式下跳过此文件", flush=True)
+            break
 
     if resp.status_code == 200:
         return resp.json()
