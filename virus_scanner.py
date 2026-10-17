@@ -23,7 +23,8 @@ v3.0: 项目分类 + 本地缓存去重 + 跳过已扫描文件
   python virus_scanner.py --list-keys                   # 查看 key 池状态
   python virus_scanner.py -f "D:\\Downloads"             # 指定文件夹
   python virus_scanner.py -f "D:\\Downloads" --project-name MyProject  # 自定义项目名
-  python virus_scanner.py -f "D:\\Downloads" --no-cache # 强制重扫
+  python virus_scanner.py -f "D:\\Downloads" --no-cache # 强制重扫（仍按扩展名过滤）
+  python virus_scanner.py -f "D:\\Downloads" --full-scan   # 全量扫描（忽略缓存+不过滤扩展名）
   python virus_scanner.py --cache-stats                 # 查看缓存统计
   python virus_scanner.py --clear-cache                 # 清空缓存
   python virus_scanner.py --report-filter scan_data.json   # 筛选报毒报告
@@ -443,14 +444,25 @@ def select_folder():
         print(f"  '{path}' 不是有效目录，请重新输入")
 
 
-def should_scan(file_path: Path):
-    """判断文件是否应该被扫描"""
+def should_scan(file_path: Path, full_scan: bool = False):
+    """判断文件是否应该被扫描
+
+    full_scan=True 时进入全量模式：不按扩展名过滤，除 0 字节文件（VT 无法分析）外全部纳入。
+    """
+    try:
+        size = file_path.stat().st_size
+    except OSError:
+        return False
+
+    if full_scan:
+        return size > 0
+
     ext = file_path.suffix.lower()
     if ext in EXCLUDE_EXTENSIONS:
         return False
     if ext in SCAN_EXTENSIONS:
         return True
-    if not ext and file_path.stat().st_size > 1024:
+    if not ext and size > 1024:
         return True
     return False
 
@@ -676,21 +688,27 @@ def export_excel(json_path, output_path):
     print(f"已导出 {len(detections_data)} 条报毒记录 → {output_path}")
 
 
-def scan_folder(folder: Path):
-    """遍历文件夹，收集待扫描文件"""
+def scan_folder(folder: Path, full_scan: bool = False):
+    """遍历文件夹，收集待扫描文件
+
+    full_scan=True 时不过滤扩展名，文本类文件同样纳入扫描，skipped_text 为空。
+    """
     files = []
     skipped_text = []
     for entry in folder.rglob("*"):
         if entry.is_file():
-            if should_scan(entry):
+            if should_scan(entry, full_scan=full_scan):
                 files.append(entry)
             elif entry.suffix.lower() in EXCLUDE_EXTENSIONS:
                 skipped_text.append(entry)
     return files, skipped_text
 
 
-def collect_targets(paths):
-    """从混合路径列表收集待扫描文件：文件直接加入，文件夹递归扫描。去重。"""
+def collect_targets(paths, full_scan=False):
+    """从混合路径列表收集待扫描文件：文件直接加入，文件夹递归扫描。去重。
+
+    full_scan=True 时目录递归不过滤扩展名（全量扫描）。
+    """
     seen = set()
     files = []
     skipped_text = []
@@ -704,12 +722,12 @@ def collect_targets(paths):
         if p.is_file():
             if p.resolve() not in seen:
                 seen.add(p.resolve())
-                if should_scan(p):
+                if should_scan(p, full_scan=full_scan):
                     files.append(p)
                 elif p.suffix.lower() in EXCLUDE_EXTENSIONS:
                     skipped_text.append(p)
         elif p.is_dir():
-            sub_files, sub_skip = scan_folder(p)
+            sub_files, sub_skip = scan_folder(p, full_scan=full_scan)
             for f in sub_files:
                 if f.resolve() not in seen:
                     seen.add(f.resolve())
@@ -1156,6 +1174,7 @@ def parse_args():
   python virus_scanner.py --list-keys                     查看 key 池状态
   python virus_scanner.py -f "D:\\Downloads"              直接指定文件夹
   python virus_scanner.py -p file.exe "D:\\Downloads"     混合指定文件和文件夹
+  python virus_scanner.py -f "D:\\Downloads" --full-scan  全量扫描：忽略缓存、不过滤扩展名
         """,
     )
     parser.add_argument("-k", "--key", default=None,
@@ -1175,7 +1194,11 @@ def parse_args():
     parser.add_argument("--project-name", default=None,
                         help="自定义项目名称（默认取扫描根目录名）")
     parser.add_argument("--no-cache", action="store_true",
-                        help="忽略本地缓存，强制上传扫描")
+                        help="忽略本地缓存，强制上传扫描（仍按扩展名过滤）")
+    parser.add_argument("--full-scan", "--full", action="store_true", dest="full_scan",
+                        help="全量扫描：忽略本地缓存 + 不按扩展名过滤，目录下全部非空文件重新检查/上传")
+    parser.add_argument("-y", "--yes", action="store_true",
+                        help="跳过扫描前的确认提示（配合 --full-scan 用于无人值守）")
     parser.add_argument("--clear-cache", action="store_true",
                         help="清空本地扫描缓存后退出")
     parser.add_argument("--cache-stats", action="store_true",
@@ -1589,7 +1612,7 @@ def main():
 
     # Step 2: 确定扫描目标
     if args.path:
-        files, skipped_text = collect_targets(args.path)
+        files, skipped_text = collect_targets(args.path, full_scan=args.full_scan)
         source_desc = ", ".join(str(Path(p).name) for p in args.path[:5])
         if len(args.path) > 5:
             source_desc += f" 等 {len(args.path)} 项"
@@ -1598,14 +1621,16 @@ def main():
         if not folder.is_dir():
             print(f"\n[错误] 指定路径不是有效目录: {args.folder}")
             sys.exit(1)
-        files, skipped_text = scan_folder(folder)
+        files, skipped_text = scan_folder(folder, full_scan=args.full_scan)
         source_desc = folder.name
     else:
         folder = select_folder()
-        files, skipped_text = scan_folder(folder)
+        files, skipped_text = scan_folder(folder, full_scan=args.full_scan)
         source_desc = folder.name
 
     print(f"  找到 {len(files)} 个待扫描文件，跳过 {len(skipped_text)} 个文本类文件")
+    if args.full_scan:
+        print(f"  {YELLOW}{BOLD}[全量扫描]{RESET} 忽略本地缓存 + 不按扩展名过滤（0 字节文件自动跳过）")
     sort_by_priority(files)
 
     if not files:
@@ -1625,12 +1650,14 @@ def main():
     print(f"\n[项目目录] {output_dir}")
 
     # Step 3: 配额预估（区分新文件 vs 缓存命中）
-    cache = load_scan_cache()
+    # 全量扫描：本地缓存不参与跳过判断（置空），但新结果仍会回写缓存
+    no_cache = args.no_cache or args.full_scan
+    cache = {} if args.full_scan else load_scan_cache()
     cached_count = 0
     new_files = []
     for f in files:
         sha = file_sha256(f)
-        if not args.no_cache and sha in cache:
+        if not no_cache and sha in cache:
             cached_count += 1
         else:
             new_files.append(f)
@@ -1644,10 +1671,13 @@ def main():
     if est_calls > daily_r and len(key_mgr.keys) < 2:
         print(f"\n  ⚠ 预估调用量 ({est_calls}) 超过当前 Key 日剩余配额 ({daily_r})")
         print(f"  建议: --add-key 添加更多 Key 实现自动切换，或等到配额重置")
-        confirm = input("\n  是否仍要继续？[y/N]: ").strip().lower()
-        if confirm != "y":
-            print("  已取消扫描。")
-            return
+        if args.yes:
+            print("  已指定 -y，自动继续。")
+        else:
+            confirm = input("\n  是否仍要继续？[y/N]: ").strip().lower()
+            if confirm != "y":
+                print("  已取消扫描。")
+                return
 
     print(f"\n预计耗时: 约 {len(new_files) * RATE_LIMIT_INTERVAL / 60:.1f} 分钟")
     print(f"速率限制: {RATE_LIMIT_PER_MINUTE} 次/分钟  |  日配额: {DAILY_QUOTA} 次  |  月配额: {MONTHLY_QUOTA/1000:.0f}K 次\n")
@@ -1676,7 +1706,7 @@ def main():
         entry = cache.get(sha)
         if not entry:
             continue
-        if args.no_cache:
+        if no_cache:
             continue
         skip_results.append({
             "filename": file_path.name, "filepath": str(file_path),
@@ -1698,7 +1728,7 @@ def main():
     for i, file_path in enumerate(files, 1):
         pause_ctrl.wait_if_paused()
         sha = file_sha256(file_path)
-        if sha in cache and not args.no_cache:
+        if sha in cache and not no_cache:
             continue  # 已在 skip_results 中
 
         api_key = key_mgr.current_key()
@@ -1708,7 +1738,7 @@ def main():
         try:
             sha256 = sha
 
-            existing = check_existing_report(api_key, sha256, key_mgr, file_path.name, no_cache=args.no_cache)
+            existing = check_existing_report(api_key, sha256, key_mgr, file_path.name, no_cache=no_cache)
             if existing:
                 # 本地缓存命中（cache_lookup）或 VT 已有报告
                 if isinstance(existing, dict) and "malicious" in existing:
@@ -1847,6 +1877,8 @@ def main():
 
     print(f"\n{'=' * 60}")
     print(f"  {status_line}")
+    if args.full_scan:
+        print(f"  模式: 全量扫描（忽略缓存 / 不过滤扩展名）")
     print(f"  总计: {len(files)} 个文件  |  缓存复用: {skipped_scan}  |  本次扫描: {len(results)}")
     print(f"  {RED}恶意: {sum(1 for r in all_results if r.get('malicious', 0) > 0)}{RESET}")
     print(f"  {YELLOW}可疑: {sum(1 for r in all_results if r.get('malicious', 0) == 0 and r.get('suspicious', 0) > 0)}{RESET}")

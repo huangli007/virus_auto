@@ -24,6 +24,7 @@ v3.0 新增：项目分类管理、SHA-256 本地缓存去重、跳过已扫描�
 - **项目分类**：每次扫描创建独立项目目录 `projects/<名称>_<时间戳>/`，所有产出内聚
 - **本地缓存**：SHA-256 索引，已扫描文件自动跳过上传，大幅节省配额
 - **强制重扫**：`--no-cache` 忽略缓存强制上传
+- **全量扫描**：`--full-scan` 忽略缓存且不按扩展名过滤，文本/配置类文件一并纳入扫描
 - **报毒详情**：为每个报毒文件生成独立 JSON + Markdown
 - **逐封确认**：生成申诉邮件前先展示全文，逐封 y/n/a/q，确认后自动通过 SMTP 发送
 - **申诉记录**：确认后生成 `_sent.md`，表格记录已申诉文件及发送状态
@@ -60,6 +61,12 @@ python virus_scanner.py -f "C:\Target" --project-name MyProject
 
 # 强制重扫（忽略缓存）
 python virus_scanner.py -f "C:\Target" --no-cache
+
+# 全量扫描（忽略缓存 + 不按扩展名过滤，目录下全部非空文件重新检查/上传）
+python virus_scanner.py -f "C:\Target" --full-scan
+
+# 全量扫描并跳过配额超限时的二次确认（用于无人值守）
+python virus_scanner.py -f "C:\Target" --full-scan -y
 
 # 混合路径扫描
 python virus_scanner.py -p "D:\file1.dll" "C:\Program Files\MyApp"
@@ -147,6 +154,8 @@ python virus_scanner.py --excel projects\Target\scan_data.json
 | `-p`, `--path` | 文件或文件夹路径（支持多个） |
 | `--project-name` | 自定义项目名称 |
 | `--no-cache` | 忽略本地缓存，强制上传 |
+| `--full-scan` / `--full` | 全量扫描：忽略本地缓存 + 不按扩展名过滤，全部非空文件重新检查/上传 |
+| `-y`, `--yes` | 跳过扫描前（配额超限时）的确认提示 |
 | `--cache-stats` | 显示缓存统计 |
 | `--clear-cache` | 清空本地扫描缓存 |
 | `--report-filter` | 从 scan_data JSON 筛选报毒项生成 HTML 报告 |
