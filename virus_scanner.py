@@ -60,7 +60,11 @@ except ImportError:
     import requests
 
 # ========== 配置 ==========
-CONFIG_DIR = Path(__file__).parent
+if getattr(sys, "frozen", False):
+    # PyInstaller 打包后：配置/缓存/项目目录定位到 exe 所在目录，避免写入临时解压目录
+    CONFIG_DIR = Path(sys.executable).parent
+else:
+    CONFIG_DIR = Path(__file__).parent
 CONFIG_FILE = CONFIG_DIR / "virus_scanner_config.json"
 SCAN_CACHE_FILE = CONFIG_DIR / "scan_cache.json"     # v3.0: 本地扫描缓存（SHA-256 索引）
 DECLARED_CACHE_FILE = CONFIG_DIR / "declared_cache.json"  # v3.0: 已申诉记录（SHA256|引擎 索引）
@@ -586,6 +590,21 @@ def declared_stats():
             f"最近申诉: {last}")
 
 
+def _load_gfe():
+    """加载误报申诉模块（generate_fp_emails）。优先走模块导入（支持打包后内嵌），
+    失败时回退到文件动态加载（开发模式）。"""
+    try:
+        import generate_fp_emails
+        return generate_fp_emails
+    except ImportError:
+        import importlib.util
+        gfe_path = Path(__file__).parent / "generate_fp_emails.py"
+        spec = importlib.util.spec_from_file_location("generate_fp_emails", gfe_path)
+        gfe = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(gfe)
+        return gfe
+
+
 def export_excel(json_path, output_path):
     """从 scan_data JSON 导出报毒清单 Excel"""
     try:
@@ -605,11 +624,7 @@ def export_excel(json_path, output_path):
         return
 
     # 加载厂家联系方式
-    gfe_path = Path(__file__).parent / "generate_fp_emails.py"
-    import importlib.util
-    spec = importlib.util.spec_from_file_location("gfe", gfe_path)
-    gfe = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(gfe)
+    gfe = _load_gfe()
     vc = getattr(gfe, "VENDOR_CONTACTS", {})
 
     # 筛选报毒文件
@@ -704,9 +719,12 @@ def scan_folder(folder: Path, full_scan: bool = False):
     return files, skipped_text
 
 
-def collect_targets(paths, full_scan=False):
+def collect_targets(paths, force_files=False, full_scan=False):
     """从混合路径列表收集待扫描文件：文件直接加入，文件夹递归扫描。去重。
 
+    force_files=True 时，显式指定的单个文件强制加入（跳过扩展名白名单过滤），
+    适用于用户明确指定要扫描某个文件（如 .scan/.apk 等非常见扩展名）的场景；
+    目录递归收集仍走 should_scan 过滤。
     full_scan=True 时目录递归不过滤扩展名（全量扫描）。
     """
     seen = set()
@@ -722,7 +740,7 @@ def collect_targets(paths, full_scan=False):
         if p.is_file():
             if p.resolve() not in seen:
                 seen.add(p.resolve())
-                if should_scan(p, full_scan=full_scan):
+                if force_files or should_scan(p, full_scan=full_scan):
                     files.append(p)
                 elif p.suffix.lower() in EXCLUDE_EXTENSIONS:
                     skipped_text.append(p)
@@ -940,9 +958,12 @@ def upload_file(api_key, file_path: Path, key_mgr):
 
 
 def get_analysis(api_key, analysis_id, key_mgr):
-    """获取分析结果，v2.0 渐进式轮询 + 免费调用"""
-    for i, interval in enumerate(PROGRESSIVE_INTERVALS):
+    """获取分析结果：持续轮询直到分析完成，不跳过未完成的文件"""
+    interval = 15
+    attempt = 0
+    while True:
         time.sleep(interval)
+        attempt += 1
         try:
             resp = vt_request("GET", f"/analyses/{analysis_id}", api_key, key_mgr, record_quota=False)
             if resp.status_code == 200:
@@ -950,9 +971,9 @@ def get_analysis(api_key, analysis_id, key_mgr):
                 status = data.get("data", {}).get("attributes", {}).get("status", "")
                 if status == "completed":
                     return data
+                print(f"  [分析中] 第 {attempt} 次轮询，状态: {status}，{interval}s 后重试...", flush=True)
         except Exception:
-            pass
-    return None
+            print(f"  [分析中] 第 {attempt} 次轮询异常，{interval}s 后重试...", flush=True)
 
 
 # ========== 报告生成 ==========
@@ -1159,6 +1180,38 @@ def generate_html_report(results, source_desc, skipped_count):
 
 # ========== 命令行参数 ==========
 
+def _repair_argv(argv):
+    """修复带空格路径被 shell/argparse 按空格拆分的问题。
+
+    例如命令行传入:  -p C:\\Program Files\\Acer\\RGB Lighting Control
+    shell 会先拆成:  ['-p', 'C:\\Program', 'Files\\Acer\\RGB', 'Lighting', 'Control']
+    本函数把无盘符、非选项开头的片段重新合并回前一个 token:
+    -> ['-p', 'C:\\Program Files\\Acer\\RGB Lighting Control']
+
+    合并规则：
+      - 以 "-" 开头           -> 选项，原样保留
+      - 含盘符(如 D:) 或以 \\ / 开头 -> 新路径起点，独立保留
+      - 前一个是选项           -> 该选项的值起点，独立保留
+      - 前一个是路径值且两者都已存在   -> 视为两个独立路径，独立保留
+      - 其余情况               -> 与前一个 token 用空格合并（路径片段）
+    """
+    repaired = []
+    for tok in argv:
+        if tok.startswith("-"):
+            repaired.append(tok)
+            continue
+        is_new_path = (len(tok) >= 2 and tok[1] == ":") or tok.startswith(("\\", "/"))
+        if not repaired or repaired[-1].startswith("-") or is_new_path:
+            repaired.append(tok)
+            continue
+        prev = repaired[-1]
+        if Path(prev).exists() and Path(tok).exists():
+            repaired.append(tok)
+            continue
+        repaired[-1] = prev + " " + tok
+    return repaired
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description="VirusTotal 批量文件扫描工具",
@@ -1211,7 +1264,7 @@ def parse_args():
                         help="从 scan_data JSON 或 detections 目录自动筛选报毒文件，逐封确认生成申诉邮件")
     parser.add_argument("--excel", default=None, metavar="SCAN_DATA_JSON",
                         help="从 scan_data JSON 导出报毒清单为 Excel，含文件路径/报毒详情/VT链接/厂家联系方式/扫毒日期")
-    return parser.parse_args()
+    return parser.parse_args(_repair_argv(sys.argv[1:]))
 
 
 # ========== 主流程 ==========
@@ -1338,14 +1391,11 @@ def main():
         target = Path(args.gen_emails)
 
         # 动态导入 generate_fp_emails 模块
-        import importlib.util
-        gfe_path = Path(__file__).parent / "generate_fp_emails.py"
-        spec = importlib.util.spec_from_file_location("generate_fp_emails", gfe_path)
-        gfe = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(gfe)
+        gfe = _load_gfe()
 
         # 收集所有待生成邮件
         email_queue = []
+        no_email_results = []
         ts = ""
 
         if target.is_file() and target.suffix == ".json":
@@ -1386,6 +1436,19 @@ def main():
                         file_name, sha256, vt_link, ename, threat,
                         github_link=uploaded_files[file_path])
                     if body is None:
+                        contact = (recipient or "").strip()
+                        is_web = contact.startswith("http")
+                        no_email_results.append({
+                            "file_name": file_name,
+                            "file_path": file_path,
+                            "sha256": sha256,
+                            "vt_link": vt_link,
+                            "engine": ename,
+                            "threat": threat,
+                            "contact": contact if is_web else "",
+                            "contact_type": "web_form" if is_web else "none",
+                            "reason": "仅提供网页表单（无邮箱）" if is_web else "无公开联系方式",
+                        })
                         continue
                     email_queue.append({
                         "file_name": file_name,
@@ -1402,8 +1465,10 @@ def main():
                 else datetime.now().strftime("%Y%m%d_%H%M%S")
 
         elif target.is_dir():
-            # 模式 2: 从 detections 目录读取（兼容旧用法）
+            # 模式 2: 从项目目录读取（兼容 scan_data 汇总 与 detections 单文件两种格式）
             json_files = sorted(target.glob("*.json"))
+            if not json_files:
+                json_files = sorted(target.glob("detections/*.json"))
             if not json_files:
                 print(f"错误: 目录下没有 JSON 文件 - {target}")
                 return
@@ -1413,40 +1478,120 @@ def main():
             for jf in json_files:
                 with open(jf, "r", encoding="utf-8") as f:
                     data = json.load(f)
-                file_name = data.get("file_name", jf.stem)
-                file_path = data.get("file_path", file_name)
-                sha256 = data.get("sha256", "")
-                vt_link = data.get("virus_total_link", "")
+                # 兼容两种 JSON 格式: 单文件 detections(dict) / scan_data 汇总数组(list)
+                records = data if isinstance(data, list) else [data]
+                for r in records:
+                    file_name = r.get("file_name", r.get("filename", jf.stem))
+                    file_path = r.get("file_path", r.get("filepath", file_name))
+                    sha256 = r.get("sha256", "")
+                    vt_link = r.get("virus_total_link", r.get("vt_link", ""))
 
-                # 每个文件只上传一次到 GitHub
-                if file_path not in uploaded_files:
-                    github_link = gfe.upload_to_github(file_path, project_name)
-                    uploaded_files[file_path] = github_link
+                    # 每个文件只上传一次到 GitHub
+                    if file_path not in uploaded_files:
+                        github_link = gfe.upload_to_github(file_path, project_name)
+                        uploaded_files[file_path] = github_link
 
-                for det in data.get("detections", []):
-                    engine = det.get("engine", "Unknown")
-                    threat = det.get("name", "Unknown")
-                    body, recipient = gfe.generate_email(file_name, sha256, vt_link, engine, threat,
-                                                         github_link=uploaded_files[file_path])
-                    if body is None:
-                        print(f"  [{engine}] 跳过 (无邮箱)")
-                        continue
-                    email_queue.append({
-                        "file_name": file_name,
-                        "file_path": file_path,
-                        "engine": engine,
-                        "threat": threat,
-                        "sha256": sha256,
-                        "vt_link": vt_link,
-                        "recipient": recipient,
-                        "body": body,
-                    })
+                    # 引擎详情: 单文件格式用 detections 列表, scan_data 格式用 engines dict
+                    detections = r.get("detections") or []
+                    if detections:
+                        det_iter = detections
+                    else:
+                        det_iter = [{"engine": ename, "name": info.get("result", info.get("category", "?")), "category": info.get("category", "")}
+                                    for ename, info in (r.get("engines") or {}).items()
+                                    if info.get("category") in ("malicious", "suspicious")]
+                    for det in det_iter:
+                        engine = det.get("engine", "Unknown")
+                        threat = det.get("name", "Unknown")
+                        body, recipient = gfe.generate_email(file_name, sha256, vt_link, engine, threat,
+                                                             github_link=uploaded_files[file_path])
+                        if body is None:
+                            contact = (recipient or "").strip()
+                            is_web = contact.startswith("http")
+                            no_email_results.append({
+                                "file_name": file_name,
+                                "file_path": file_path,
+                                "sha256": sha256,
+                                "vt_link": vt_link,
+                                "engine": engine,
+                                "threat": threat,
+                                "contact": contact if is_web else "",
+                                "contact_type": "web_form" if is_web else "none",
+                                "reason": "仅提供网页表单（无邮箱）" if is_web else "无公开联系方式",
+                            })
+                            print(f"  [{engine}] 跳过 (无邮箱)"
+                                  + (f" → 表单地址: {contact}" if is_web else "（未收录公开联系方式）"))
+                            continue
+                        email_queue.append({
+                            "file_name": file_name,
+                            "file_path": file_path,
+                            "engine": engine,
+                            "threat": threat,
+                            "sha256": sha256,
+                            "vt_link": vt_link,
+                            "recipient": recipient,
+                            "body": body,
+                        })
 
             ts = target.name.split("_", 1)[-1] if "_" in target.name \
                 else datetime.now().strftime("%Y%m%d_%H%M%S")
         else:
             print(f"错误: 路径不存在或不是 JSON 文件/目录 - {target}")
             return
+
+        # 无邮箱联系方式的报毒引擎记录（无论后续是否发送成功都会落盘）
+        if no_email_results:
+            ne_output_dir = target.parent / f"emails_{ts}"
+            ne_output_dir.mkdir(parents=True, exist_ok=True)
+
+            # 按厂商聚合申报入口（同一厂商多条记录只列一次，保留首次出现的网址）
+            vendor_urls = {}
+            for ne in no_email_results:
+                eng = ne.get("engine", "?")
+                if eng not in vendor_urls or (not vendor_urls[eng] and ne.get("contact")):
+                    vendor_urls[eng] = ne.get("contact", "")
+            web_vendors = {k: v for k, v in vendor_urls.items() if v}
+            no_contact_vendors = sorted(k for k, v in vendor_urls.items() if not v)
+
+            ne_md_path = ne_output_dir / "_no_email.md"
+            with open(ne_md_path, "w", encoding="utf-8") as f:
+                f.write(f"# 无邮箱联系方式的报毒信息\n\n")
+                f.write(f"生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+                f.write(f"- 报毒记录: **{len(no_email_results)}** 条\n")
+                f.write(f"- 涉及厂商: **{len(vendor_urls)}** 个（其中 **{len(web_vendors)}** 个提供网页表单申报入口，"
+                        f"**{len(no_contact_vendors)}** 个未收录公开联系方式）\n\n")
+
+                f.write(f"## 明细\n\n")
+                f.write(f"| # | 文件 | SHA256 | 引擎 | 报毒名 | 申报网址 | 说明 |\n")
+                f.write(f"|---|------|--------|------|--------|----------|------|\n")
+                for idx, ne in enumerate(no_email_results, 1):
+                    sha_short = ne["sha256"][:12] + "..." if len(ne["sha256"]) > 12 else ne["sha256"]
+                    url = ne.get("contact") or "—"
+                    f.write(f"| {idx} | {ne['file_path']} | {sha_short} | {ne['engine']} | {ne['threat']} | {url} | {ne['reason']} |\n")
+
+                if web_vendors:
+                    f.write(f"\n## 网页表单申报入口（按厂商去重）\n\n")
+                    for eng in sorted(web_vendors):
+                        f.write(f"- **{eng}** — {web_vendors[eng]}\n")
+
+                if no_contact_vendors:
+                    f.write(f"\n## 未收录公开联系方式的厂商\n\n")
+                    f.write(f"需人工到厂商官网查找「误报提交 / False Positive」页面：\n\n")
+                    for eng in no_contact_vendors:
+                        f.write(f"- {eng}\n")
+
+                f.write(f"\n> 提示：可编辑 `generate_fp_emails.py` 的 `VENDOR_CONTACTS` 补录邮箱或表单网址，"
+                        f"补录后重新生成即可自动发送。\n")
+
+            ne_json_path = ne_output_dir / "_no_email.json"
+            with open(ne_json_path, "w", encoding="utf-8") as f:
+                json.dump(no_email_results, f, ensure_ascii=False, indent=2)
+
+            print(f"\n📌 {len(no_email_results)} 条报毒引擎无邮箱联系方式，已记录: {ne_md_path}")
+            if web_vendors:
+                print(f"   {len(web_vendors)} 个厂商提供网页表单申报入口，网址已写入报告")
+            if no_contact_vendors:
+                print(f"   {len(no_contact_vendors)} 个厂商未收录公开联系方式")
+            print(f"   记录文件: {ne_json_path}\n")
 
         if not email_queue:
             print("没有可生成的邮件（所有引擎均无邮箱联系方式）。")
@@ -1521,6 +1666,7 @@ def main():
         output_dir.mkdir(parents=True, exist_ok=True)
 
         send_results = []
+        unsent_results = []
         for em in confirmed:
             safe_file = "".join(c if c.isalnum() or c in "._- " else "_" for c in em["file_name"])
             safe_engine = "".join(c if c.isalnum() or c in "._- " else "_" for c in em["engine"])
@@ -1540,6 +1686,11 @@ def main():
                 status = "已发送"
             else:
                 status = f"失败: {err}"
+                unsent_results.append({
+                    **em,
+                    "subject": subject,
+                    "error": err,
+                })
             send_results.append({**em, "status": status})
             print(f"  [{em['engine']}] {status}")
 
@@ -1562,9 +1713,29 @@ def main():
             sent_cnt = sum(1 for sr in send_results if sr["status"] == "已发送")
             f.write(f"\n共 **{len(confirmed)}** 封申诉邮件，已发送 **{sent_cnt}** 封。\n")
 
+        # 未发送邮件记录：MD 表格 + JSON（含完整重发字段）
+        if unsent_results:
+            unsent_md_path = output_dir / "_unsent.md"
+            with open(unsent_md_path, "w", encoding="utf-8") as f:
+                f.write(f"# 误报申诉未发送记录\n\n")
+                f.write(f"生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+                f.write(f"| # | 文件 | SHA256 | 引擎 | 报毒名 | 收件人 | 失败原因 |\n")
+                f.write(f"|---|------|--------|------|--------|--------|----------|\n")
+                for idx, ur in enumerate(unsent_results, 1):
+                    sha_short = ur["sha256"][:12] + "..." if len(ur["sha256"]) > 12 else ur["sha256"]
+                    f.write(f"| {idx} | {ur['file_path']} | {sha_short} | {ur['engine']} | {ur['threat']} | {ur['recipient']} | {ur['error']} |\n")
+                f.write(f"\n共 **{len(unsent_results)}** 封申诉邮件未发送成功。\n")
+
+            unsent_json_path = output_dir / "_unsent.json"
+            with open(unsent_json_path, "w", encoding="utf-8") as f:
+                json.dump(unsent_results, f, ensure_ascii=False, indent=2)
+
         print(f"\n{'=' * 60}")
         sent_cnt = sum(1 for sr in send_results if sr["status"] == "已发送")
+        unsent_cnt = len(unsent_results)
         print(f"  已确认 {len(confirmed)}/{len(email_queue)} 封，成功发送 {sent_cnt} 封")
+        if unsent_cnt:
+            print(f"  {RED}未发送 {unsent_cnt} 封{RESET}，记录: {output_dir / '_unsent.md'} / {output_dir / '_unsent.json'}")
         print(f"  邮件目录: {output_dir}")
         print(f"  汇总清单: {summary_path}")
         print(f"  申诉记录: {md_path}")
@@ -1612,7 +1783,7 @@ def main():
 
     # Step 2: 确定扫描目标
     if args.path:
-        files, skipped_text = collect_targets(args.path, full_scan=args.full_scan)
+        files, skipped_text = collect_targets(args.path, force_files=True, full_scan=args.full_scan)
         source_desc = ", ".join(str(Path(p).name) for p in args.path[:5])
         if len(args.path) > 5:
             source_desc += f" 等 {len(args.path)} 项"

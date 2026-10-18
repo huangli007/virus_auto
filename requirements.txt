@@ -1,2 +1,4 @@
 requests>=2.25
 pynput>=1.7
+openpyxl>=3.0
+ttkbootstrap>=1.10

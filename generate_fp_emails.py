@@ -160,7 +160,13 @@ SENDER_EMAIL = "1041032635@qq.com"
 SENDER_NAME = "cattle_chen"
 
 # ========== SMTP 配置 ==========
-SMTP_CONFIG_FILE = Path(__file__).parent / "smtp_config.json"
+if getattr(sys, "frozen", False):
+    # PyInstaller 打包后：配置定位到 exe 所在目录
+    _BASE_DIR = Path(sys.executable).parent
+else:
+    _BASE_DIR = Path(__file__).parent
+
+SMTP_CONFIG_FILE = _BASE_DIR / "smtp_config.json"
 
 SMTP_DEFAULTS = {
     "host": "smtp.qq.com",
@@ -232,7 +238,7 @@ def send_fp_email(recipient, subject, body, attachment_path=None):
 
 
 # ========== GitHub 误报仓库上传 ==========
-FP_REPO_DIR = Path(__file__).parent.parent / "False-Positive-Report"
+FP_REPO_DIR = Path(_BASE_DIR).parent / "False-Positive-Report"
 FP_REPO_URL = "https://github.com/huangli007/False-Positive-Report"
 FP_MANIFEST_FILE = FP_REPO_DIR / "manifest.json"
 
@@ -262,24 +268,29 @@ def _save_manifest(manifest):
         json.dump(manifest, f, indent=2, ensure_ascii=False)
 
 
-def upload_to_github(file_path, project_name):
-    """将报毒文件上传到 GitHub 误报仓库（SHA-256 去重）。返回 GitHub 文件 URL 或 None"""
+def upload_to_github(file_path, project_name, sha256=None):
+    """将报毒文件上传到 GitHub 误报仓库（SHA-256 去重）。返回 GitHub 文件 URL 或 None。
+    sha256 可由调用方传入：本地文件已不存在但曾上传过时，仍可返回已记录的上传地址。"""
     import shutil
     import subprocess
 
     src = Path(file_path)
-    if not src.is_file():
-        return None
     if not FP_REPO_DIR.is_dir():
         return None
 
-    sha = _file_sha256(src)
     manifest = _load_manifest()
 
-    # 已上传过 → 直接返回已有 URL
-    if sha in manifest:
+    # 优先使用调用方提供的 sha256 查重（文件可能已不存在）
+    sha = sha256
+    if src.is_file():
+        sha = _file_sha256(src)
+    if sha and sha in manifest:
         rel = manifest[sha]
         return f"{FP_REPO_URL}/blob/main/{rel}"
+
+    # 未上传过且本地文件不存在 → 无法上传
+    if not src.is_file():
+        return None
 
     # 目标目录: repo/project_name/
     dest_dir = FP_REPO_DIR / project_name
