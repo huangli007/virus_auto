@@ -48,7 +48,7 @@ COLOR_WARNING = "#dfab2e"
 COLOR_SUCCESS = "#448361"
 
 APP_NAME = "VirusTotal Scanner"
-APP_VERSION = "v4.2"
+APP_VERSION = "v5.0"
 
 
 
