@@ -44,3 +44,23 @@ dist.rar
 build_log.txt
 build_err.txt
 scan_cache_v32.db
+
+# 历史试验产物（v3.2 / 优化版试验文件，保留在磁盘但不入库）
+/virus_scanner_v32.py
+/virus_scanner_optimized.py
+/run_optimized.py
+/install_optimized.py
+/example_optimized_usage.py
+/test_optimization.py
+/performance_monitor.py
+/final_check.py
+/gui_scan_test.py
+/gui_smoke_test.py
+/config_template.json
+/OPTIMIZATION_*.md
+/V32_*.md
+/CHANGES.md
+/CHECKLIST.md
+/FINAL_SUMMARY.md
+/QUICK_START.md
+/README_OPTIMIZED.md

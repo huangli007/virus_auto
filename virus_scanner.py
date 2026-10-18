@@ -605,6 +605,209 @@ def _load_gfe():
         return gfe
 
 
+def iter_detection_records(target):
+    """读取 scan_data JSON 或项目目录，返回报毒记录。
+
+    统一成 [{"file_name","file_path","sha256","vt_link","dets":[(engine, threat)]}]，
+    兼容 scan_data 汇总数组、单文件 detections dict、detections/*.json 三种形态。
+    """
+    target = Path(target)
+    if target.is_file() and target.suffix == ".json":
+        files = [target]
+    elif target.is_dir():
+        files = sorted(target.glob("*.json")) or sorted(target.glob("detections/*.json"))
+    else:
+        return []
+
+    records = []
+    for jf in files:
+        try:
+            with open(jf, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            continue
+        rows = data if isinstance(data, list) else [data]
+        for r in rows:
+            if not isinstance(r, dict):
+                continue
+            file_name = r.get("file_name") or r.get("filename") or jf.stem
+            file_path = r.get("file_path") or r.get("filepath") or file_name
+            dets = [(d.get("engine", ""), d.get("name", ""))
+                    for d in (r.get("detections") or []) if isinstance(d, dict)]
+            if not dets:
+                dets = [(en, info.get("result") or info.get("category") or "")
+                        for en, info in (r.get("engines") or {}).items()
+                        if info.get("category") in ("malicious", "suspicious")]
+            dets = [(e, t) for e, t in dets if e]
+            if not dets:
+                continue
+            records.append({
+                "file_name": file_name,
+                "file_path": file_path,
+                "sha256": r.get("sha256", ""),
+                "vt_link": r.get("virus_total_link") or r.get("vt_link") or "",
+                "dets": dets,
+            })
+    return records
+
+
+def submit_to_vendors(args):
+    """把报毒样本自动提交到「无邮箱、只能走网页表单」的厂商。"""
+    try:
+        import vendor_upload as vu
+        import vendor_registry as vr
+    except ImportError as exc:
+        print(f"错误: 缺少提交模块 - {exc}")
+        return
+
+    target = _resolve_target(args.submit_vendors, prefer_detections=True)
+    if target is None:
+        return
+    if not target.exists():
+        print(f"错误: 路径不存在 - {target}")
+        return
+
+    records = iter_detection_records(target)
+    if not records:
+        det_path = target / "scan_data.json" if target.is_dir() else target
+        det_count = 0
+        try:
+            with open(det_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            rows = data if isinstance(data, list) else [data]
+            det_count = sum(1 for r in rows if isinstance(r, dict)
+                            and (r.get("malicious", 0) > 0 or r.get("suspicious", 0) > 0))
+        except Exception:
+            pass
+        if det_count:
+            print(f"该项目有 {det_count} 个报毒文件，但记录里没有引擎明细（多为缓存命中结果）。")
+            print("请用 --no-cache 重新扫描该项目，或指定含 detections 明细的目录。")
+        else:
+            print("该项目没有报毒文件。")
+        return
+
+    only = None
+    if args.submit_engines:
+        only = {s.strip() for s in args.submit_engines.split(",") if s.strip()}
+
+    tasks = vu.build_tasks(records, only, include_manual=True)
+    auto_tasks = [t for t in tasks if t.get("mode") == "auto"]
+    manual_tasks = [t for t in tasks if t.get("mode") == "manual"]
+    if not tasks:
+        print("没有可提交的厂商（该批报毒引擎均为邮箱类）。")
+        print("\n当前支持自动上传的厂商：")
+        for eng, info in sorted(vr.uploadable_vendors().items()):
+            print(f"  {eng:14} {info.get('kind'):10} {info.get('url')}")
+        return
+
+    print(f"解析到 {len(records)} 条报毒记录，共 {len(tasks)} 项："
+          f"自动 {len(auto_tasks)} · 人工 {len(manual_tasks)}")
+    by_engine = {}
+    for t in tasks:
+        by_engine.setdefault(t["engine"], {"n": 0, "mode": t.get("mode")})["n"] += 1
+    for eng, meta in sorted(by_engine.items()):
+        kind = (vr.get_registry().get(eng) or {}).get("kind")
+        print(f"  {eng:14} {kind:10} {meta['n']} 个文件（{meta['mode']}）")
+    print()
+
+    gfe = _load_gfe()
+    email_addr = getattr(gfe, "SENDER_EMAIL", "") or ""
+    headless = bool(args.submit_headless)
+    dry_run = bool(getattr(args, "submit_dry_run", False))
+
+    def _ask(engine, url, meta):
+        print(f"\n  ▶ {engine} 已打开并预填：{url}")
+        print("    请在浏览器里完成验证码并点提交。回车=已提交，输入 s=跳过")
+        try:
+            return input("    > ").strip().lower() != "s"
+        except EOFError:
+            return False
+
+    results: list = []
+    if auto_tasks:
+        with vu.VendorSubmitter(email=email_addr, headless=headless, dry_run=dry_run,
+                                on_manual=None if headless else _ask, log=print) as sub:
+            results = sub.submit_batch(auto_tasks)
+
+    # ---- 人工项：打开上传网址，逐个确认 ----
+    import webbrowser
+    entries = []
+    for t in manual_tasks:
+        entries.append({
+            "engine": t["engine"], "url": t.get("url", ""),
+            "file_name": Path(t.get("file_path", "")).name or "?",
+            "file_path": t.get("file_path", ""), "sha256": t.get("sha256", ""),
+            "threat": t.get("threat", ""), "kind": t.get("kind", ""),
+            "note": t.get("note", ""), "prefilled": False,
+        })
+    task_by_engine = {t["engine"]: t for t in tasks}
+    for r in results:
+        if r.status not in ("needs_manual", "failed"):
+            continue
+        t = task_by_engine.get(r.engine, {})
+        entries.append({
+            "engine": r.engine, "url": r.url or t.get("url", ""),
+            "file_name": r.file_name, "file_path": r.file_path,
+            "sha256": r.sha256, "threat": t.get("threat", ""),
+            "kind": t.get("kind", ""),
+            "note": (f"自动上传未完成：{r.detail}" if r.status == "failed" else r.detail),
+            "prefilled": r.status == "needs_manual",
+        })
+
+    if entries:
+        print(f"\n{'=' * 70}")
+        print(f"  以下 {len(entries)} 项需人工在厂商网站提交")
+        print(f"{'=' * 70}")
+        # 这些条目稍后会重新生成结果，先剔掉自动流程里的待人工/失败记录，避免重复计入
+        replaced = {(r.engine, r.file_path) for r in results
+                    if r.status in ("needs_manual", "failed")}
+        results = [r for r in results if (r.engine, r.file_path) not in replaced]
+        for idx, e in enumerate(entries, 1):
+            print(f"\n[{idx}/{len(entries)}] {e['engine']}  "
+                  f"（{e['kind']}）")
+            print(f"  上传网址 : {e['url'] or '—'}")
+            print(f"  文件     : {e['file_name']}")
+            print(f"  路径     : {e['file_path']}")
+            print(f"  SHA256   : {e['sha256']}")
+            print(f"  报毒     : {e['threat']}")
+            if e["note"]:
+                print(f"  说明     : {e['note']}")
+            if e["prefilled"]:
+                print("  （浏览器窗口已打开并预填，直接在里面完成验证码提交即可）")
+            if not headless and e["url"]:
+                try:
+                    webbrowser.open(e["url"])
+                except Exception:
+                    pass
+            status = "needs_manual"
+            if not headless:
+                try:
+                    ans = input("  [已上传 y / 跳过 n / 退出 q]: ").strip().lower()
+                except EOFError:
+                    ans = "q"
+                if ans == "y":
+                    status = "submitted"
+                elif ans == "q":
+                    results.append(vu.SubmitResult(
+                        e["engine"], e["file_name"], e["file_path"], e["sha256"],
+                        status, method="manual", url=e["url"], detail="未确认"))
+                    break
+            results.append(vu.SubmitResult(
+                e["engine"], e["file_name"], e["file_path"], e["sha256"],
+                status, method="manual", url=e["url"],
+                detail="人工提交向导确认" if status == "submitted" else "未确认，需人工补提交"))
+
+    base_dir = target if target.is_dir() else target.parent
+    out_dir = base_dir / f"vendor_submit_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    stats = vu.write_report(results, out_dir)
+    print(f"\n{'=' * 60}")
+    print(f"  已提交 {stats['submitted']} · 待人工 {stats['needs_manual']} · 失败 {stats['failed']} / 共 {stats['total']}")
+    print(f"  记录: {stats['md']}")
+    print(f"  明细: {stats['json']}")
+    if stats["needs_manual"]:
+        print("  ⚠ 待人工的厂商页面已保留打开，或按报告里的链接手工提交")
+
+
 def export_excel(json_path, output_path):
     """从 scan_data JSON 导出报毒清单 Excel"""
     try:
@@ -1212,22 +1415,140 @@ def _repair_argv(argv):
     return repaired
 
 
+LATEST = "@latest"
+
+# 简写动作 -> (展开成的长参数, 是否需要路径)
+_ACTIONS = {
+    "scan": (None, "path"),
+    "submit": ("--submit-vendors", "path"),
+    "email": ("--gen-emails", "path"),
+    "err": ("--err", "path"),
+    "excel": ("--excel", "path"),
+    "filter": ("--report-filter", "path"),
+    "keys": ("--list-keys", None),
+    "cache": ("--cache-stats", None),
+    "cache-clear": ("--clear-cache", None),
+}
+
+
+def _expand_aliases(argv):
+    """把 `submit <路径>` 这类简写展开成对应的长参数。
+
+    支持的动作：scan / submit / email / err / excel / filter / keys / cache / cache-clear。
+    submit / email 等可省略路径，默认取最新扫描项目（@latest）。
+    """
+    if not argv:
+        return argv
+    head = argv[0]
+    if head.startswith("-"):
+        return argv
+    spec = _ACTIONS.get(head.lower())
+    if spec is None:
+        return argv
+
+    flag, takes = spec
+    rest = list(argv[1:])
+    if takes == "path":
+        path = None
+        if rest and not rest[0].startswith("-"):
+            path, rest = rest[0], rest[1:]
+        if path is None and flag in ("--submit-vendors", "--gen-emails",
+                                     "--err", "--excel", "--report-filter"):
+            path = LATEST          # 省略路径 -> 用最新项目
+        if path is None:
+            print(f"用法: python virus_scanner.py {head} <扫描结果文件或项目目录>")
+            raise SystemExit(2)
+        if flag is None:            # scan
+            return ["-p", path] + rest
+        return [flag, path] + rest
+    return ([flag] if flag else []) + rest
+
+
+def _latest_project(prefer_detections: bool = False):
+    """返回 projects/ 下最近修改、且含 scan_data.json 的项目目录。
+
+    prefer_detections=True 时，优先挑「确实有报毒记录」的最新项目
+    （submit / email 这类动作只对报毒项有意义）。
+    """
+    if not PROJECTS_DIR.is_dir():
+        return None
+    cands = [p for p in PROJECTS_DIR.iterdir()
+             if p.is_dir() and (p / "scan_data.json").is_file()]
+    if not cands:
+        return None
+    cands.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    if not prefer_detections:
+        return cands[0]
+
+    for proj in cands:
+        try:
+            with open(proj / "scan_data.json", "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            continue
+        if isinstance(data, list) and any(
+                (r.get("malicious", 0) > 0 or r.get("suspicious", 0) > 0)
+                and (r.get("engines") or r.get("detections"))
+                for r in data):
+            return proj
+    return cands[0]
+
+
+def _resolve_target(spec, prefer_detections: bool = False):
+    """把 @latest 解析成最新项目目录，其它值按路径处理。"""
+    if str(spec) == LATEST:
+        proj = _latest_project(prefer_detections)
+        if proj is None:
+            print("没有可用的扫描项目（projects/ 下没有含 scan_data.json 的目录）")
+            return None
+        print(f"使用项目: {proj.name}")
+        return proj
+    return Path(spec)
+
+
+def _resolve_json(spec, prefer_detections: bool = True):
+    """解析 scan_data JSON：支持 @latest、项目目录、直接给 json 文件。"""
+    p = _resolve_target(spec, prefer_detections)
+    if p is None:
+        return None
+    if p.is_dir():
+        j = p / "scan_data.json"
+        if not j.is_file():
+            print(f"目录下没有 scan_data.json: {p}")
+            return None
+        return j
+    if not p.is_file():
+        print(f"错误: 文件不存在 - {p}")
+        return None
+    return p
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="VirusTotal 批量文件扫描工具",
+        description="VirusTotal 批量文件扫描工具（支持简写动作：scan / submit / email / err / excel / filter / keys / cache）",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-示例:
-  python virus_scanner.py                                 交互模式
-  python virus_scanner.py -k YOUR_KEY                     临时 key
-  python virus_scanner.py -k YOUR_KEY --save-key          添加 key 到池
-  python virus_scanner.py --add-key                       交互添加 key
-  python virus_scanner.py --add-key YOUR_KEY              命令行添加 key
-  python virus_scanner.py --key-file keys.txt             从文件加载 key 池
-  python virus_scanner.py --list-keys                     查看 key 池状态
-  python virus_scanner.py -f "D:\\Downloads"              直接指定文件夹
-  python virus_scanner.py -p file.exe "D:\\Downloads"     混合指定文件和文件夹
-  python virus_scanner.py -f "D:\\Downloads" --full-scan  全量扫描：忽略缓存、不过滤扩展名
+简写（推荐）:
+  python virus_scanner.py scan "D:\\Downloads"        扫描文件夹（= -f）
+  python virus_scanner.py scan "D:\\X" --full-scan    全量扫描
+  python virus_scanner.py submit                      提交最新项目的报毒文件到厂商网站
+  python virus_scanner.py submit projects\\Target      指定项目
+  python virus_scanner.py submit --dry                只预填不提交（试运行）
+  python virus_scanner.py submit -e Fortinet,APEX     只提交指定厂商
+  python virus_scanner.py email                       给最新项目的报毒项发申诉邮件
+  python virus_scanner.py err projects\\Target         终端文本报毒报告
+  python virus_scanner.py excel projects\\Target       导出报毒清单 Excel
+  python virus_scanner.py filter projects\\Target      只含报毒项的 HTML 报告
+  python virus_scanner.py keys                        查看 Key 池状态
+  python virus_scanner.py cache                       查看缓存统计
+  python virus_scanner.py cache-clear                 清空缓存
+
+完整参数:
+  python virus_scanner.py -k YOUR_KEY                 临时 key
+  python virus_scanner.py -k YOUR_KEY --save-key      添加 key 到池
+  python virus_scanner.py --add-key [KEY]             添加 key
+  python virus_scanner.py --key-file keys.txt         从文件加载 key 池
+  python virus_scanner.py -p file.exe "D:\\Downloads" 混合指定文件和文件夹
         """,
     )
     parser.add_argument("-k", "--key", default=None,
@@ -1256,15 +1577,23 @@ def parse_args():
                         help="清空本地扫描缓存后退出")
     parser.add_argument("--cache-stats", action="store_true",
                         help="显示缓存统计信息")
-    parser.add_argument("--report-filter", default=None, metavar="SCAN_DATA_JSON",
+    parser.add_argument("--report-filter", "--filter", default=None, metavar="SCAN_DATA_JSON",
                         help="从已有 scan_data JSON 筛选报毒文件，生成仅含报毒项的 HTML 报告")
-    parser.add_argument("--err", default=None, metavar="SCAN_DATA_JSON",
+    parser.add_argument("-r", "--err", default=None, metavar="SCAN_DATA_JSON",
                         help="输出报毒文件测试报告（文本），列出所有恶意/可疑文件及引擎详情")
-    parser.add_argument("--gen-emails", default=None, metavar="SCAN_DATA_OR_DIR",
+    parser.add_argument("-E", "--gen-emails", default=None, metavar="SCAN_DATA_OR_DIR",
                         help="从 scan_data JSON 或 detections 目录自动筛选报毒文件，逐封确认生成申诉邮件")
-    parser.add_argument("--excel", default=None, metavar="SCAN_DATA_JSON",
+    parser.add_argument("-S", "--submit-vendors", default=None, metavar="SCAN_DATA_OR_DIR",
+                        help="把报毒文件自动提交到厂商网站（无邮箱厂商的网页表单），需 playwright")
+    parser.add_argument("-e", "--submit-engines", default=None, metavar="A,B,C",
+                        help="配合 -S，只提交指定厂商（逗号分隔）")
+    parser.add_argument("-n", "--dry", "--submit-dry-run", action="store_true", dest="submit_dry_run",
+                        help="配合 -S，只打开并预填页面做验证，不真正点提交")
+    parser.add_argument("--headless", "--submit-headless", action="store_true", dest="submit_headless",
+                        help="配合 -S，用无头浏览器（遇验证码只能记入待人工清单）")
+    parser.add_argument("-x", "--excel", default=None, metavar="SCAN_DATA_JSON",
                         help="从 scan_data JSON 导出报毒清单为 Excel，含文件路径/报毒详情/VT链接/厂家联系方式/扫毒日期")
-    return parser.parse_args(_repair_argv(sys.argv[1:]))
+    return parser.parse_args(_repair_argv(_expand_aliases(sys.argv[1:])))
 
 
 # ========== 主流程 ==========
@@ -1311,7 +1640,9 @@ def main():
     # ----- 报告筛选命令 ----
 
     if args.report_filter:
-        json_path = Path(args.report_filter)
+        json_path = _resolve_json(args.report_filter)
+        if json_path is None:
+            return
         if not json_path.is_file():
             print(f"错误: 文件不存在 - {json_path}")
             return
@@ -1338,7 +1669,9 @@ def main():
     # ----- 报毒测试报告命令 ----
 
     if args.err:
-        json_path = Path(args.err)
+        json_path = _resolve_json(args.err)
+        if json_path is None:
+            return
         if not json_path.is_file():
             print(f"错误: 文件不存在 - {json_path}")
             return
@@ -1385,10 +1718,18 @@ def main():
         print(f"  {BOLD}合计: {RED}{m_cnt} 恶意{RESET}{BOLD}, {YELLOW}{s_cnt} 可疑{RESET}")
         return
 
-    # ----- 生成申诉邮件命令 ----
+    # ----- 自动提交到厂商网站 -----
+
+    if args.submit_vendors:
+        submit_to_vendors(args)
+        return
+
+    # ----- 生成申诉邮件命令 -----
 
     if args.gen_emails:
-        target = Path(args.gen_emails)
+        target = _resolve_target(args.gen_emails, prefer_detections=True)
+        if target is None:
+            return
 
         # 动态导入 generate_fp_emails 模块
         gfe = _load_gfe()
@@ -1745,7 +2086,9 @@ def main():
     # ----- 导出报毒 Excel 命令 ----
 
     if args.excel:
-        json_path = Path(args.excel)
+        json_path = _resolve_json(args.excel)
+        if json_path is None:
+            return
         if not json_path.exists():
             print(f"错误: 文件不存在 - {json_path}")
             return

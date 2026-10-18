@@ -94,6 +94,15 @@ class VirusScannerGUI:
         # 报告预览状态：刷新项目列表期间屏蔽选中事件，避免重复生成
         self._refreshing_projects = False
 
+        # 厂商网站自动提交状态
+        self._vendor_tasks = []
+        self._vendor_results = []
+        self._vendor_out_dir = None
+        self._vendor_submitter = None
+        self._vendor_close_event = threading.Event()
+        self._manual_event = threading.Event()
+        self._manual_answer = False
+
         self._init_window()
         self._build_sidebar()
         self._build_pages()
@@ -583,6 +592,8 @@ class VirusScannerGUI:
                    command=self.send_selected_emails).pack(side=LEFT, padx=(8, 0))
         ttk.Button(row3, text="仅生成文件（不发送）", style="Outline.TButton",
                    command=self.export_email_files).pack(side=LEFT, padx=(8, 0))
+        ttk.Button(row3, text="自动上传到厂商网站", style="Outline.TButton",
+                   command=self.start_vendor_submit).pack(side=LEFT, padx=(8, 0))
 
         # 申诉进度：GitHub 样本上传 / 邮件发送共用
         prog_row = ttk.Frame(card2, style="Card.TFrame")
@@ -712,6 +723,24 @@ class VirusScannerGUI:
                             self.email_status_label.configure(text=text)
                     elif kind == "email_status":
                         self.email_status_label.configure(text=str(payload))
+                    elif kind == "vendor_progress":
+                        step, desc = payload
+                        self.email_status_label.configure(text=f"{step} · {desc}")
+                    elif kind == "vendor_manual":
+                        engine, url = payload
+                        ret = ttk.Messagebox.show_question(
+                            f"{engine} 需要人工确认",
+                            f"浏览器已打开并预填：\n{url}\n\n"
+                            f"请在浏览器里完成验证码并点击提交。\n"
+                            f"完成后选「已提交」，要跳过选「跳过」。",
+                            buttons=["已提交", "跳过"], parent=self.root)
+                        self._manual_answer = (ret == "已提交")
+                        self._manual_event.set()
+                    elif kind == "vendor_stage_done":
+                        self._on_vendor_stage_done()
+                    elif kind == "vendor_done":
+                        self.email_status_label.configure(text="厂商提交失败")
+                        self.email_progress.configure(value=0)
                     elif kind == "email_confirm":
                         title, message = payload[0], payload[1]
                         ret = ttk.Messagebox.show_question(
@@ -1629,6 +1658,192 @@ class VirusScannerGUI:
                 self._email_status("没有可发送的邮件")
         finally:
             self.email_running = False
+
+    # ---------- 自动上传到厂商网站 ----------
+
+    def start_vendor_submit(self):
+        """把报毒样本自动提交到「无邮箱、只能走网页表单」的厂商。"""
+        if self.email_running:
+            ttk.Messagebox.show_info("正在处理", "当前已有任务在运行，请稍候", parent=self.root)
+            return
+        src = self.email_src_entry.get().strip()
+        if not src:
+            ttk.Messagebox.show_info("请选择数据源", "请选择 scan_data.json 或 detections 目录",
+                                     parent=self.root)
+            return
+        try:
+            import vendor_registry as vr
+            import vendor_upload as vu
+        except ImportError as exc:
+            ttk.Messagebox.show_error("模块缺失", f"无法加载厂商提交模块：{exc}", parent=self.root)
+            return
+
+        records = vs.iter_detection_records(Path(src))
+        tasks = vu.build_tasks(records, include_manual=True)
+        if not tasks:
+            names = "、".join(sorted(vr.uploadable_vendors()))
+            ttk.Messagebox.show_info(
+                "没有可提交的厂商",
+                f"该批报毒引擎中没有可提交的厂商。\n\n"
+                f"当前支持自动上传的有：\n{names}\n\n"
+                f"其余厂商请用「一键申诉」走邮件渠道。",
+                parent=self.root)
+            return
+
+        auto_tasks = [t for t in tasks if t.get("mode") == "auto"]
+        manual_tasks = [t for t in tasks if t.get("mode") == "manual"]
+        by_engine = {}
+        for t in tasks:
+            by_engine[t["engine"]] = by_engine.get(t["engine"], 0) + 1
+        detail = "\n".join(
+            f"  · {e}（{n} 个文件）" + ("　自动" if any(
+                x["engine"] == e and x.get("mode") == "auto" for x in tasks) else "　人工")
+            for e, n in sorted(by_engine.items()))
+        ret = ttk.Messagebox.show_question(
+            "上传到厂商网站",
+            f"共 {len(tasks)} 项：自动 {len(auto_tasks)} 项、人工 {len(manual_tasks)} 项\n\n{detail}\n\n"
+            f"· 自动项：程序打开浏览器并预填文件 / SHA256 / 邮箱 / 说明\n"
+            f"· 人工项：弹出向导窗口，逐个打开上传网址，你传完点「已上传」\n"
+            f"· 遇到验证码时窗口会等你点完再继续\n\n"
+            f"是否开始？",
+            buttons=["开始", "取消"], parent=self.root)
+        if ret != "开始":
+            return
+
+        self._vendor_tasks = tasks
+        self._vendor_results = []
+        self._vendor_out_dir = None
+        self._vendor_close_event.clear()
+        self.email_running = True
+        self.email_progress.configure(value=0)
+        self._email_status(f"厂商提交：自动 {len(auto_tasks)} · 人工 {len(manual_tasks)}")
+        self._email_log_line(
+            f"[厂商提交] 数据源: {src}，自动 {len(auto_tasks)} 项 / 人工 {len(manual_tasks)} 项\n",
+            "success")
+        self._email_src = src
+        self._run_thread(self._vendor_submit_worker)
+
+    def _vendor_submit_worker(self):
+        import vendor_upload as vu
+        sub = None
+        try:
+            auto_tasks = [t for t in self._vendor_tasks if t.get("mode") == "auto"]
+            results = []
+            if auto_tasks:
+                sub = vu.VendorSubmitter(
+                    email=getattr(gfe, "SENDER_EMAIL", ""),
+                    headless=False,
+                    on_manual=self._gui_on_manual,
+                    on_progress=lambda s, d: self.log_q.put(
+                        ("vendor_progress", (s, d), None)),
+                    log=lambda m: self.log_q.put(("email_log", f"{m}\n", None)),
+                )
+                self._vendor_submitter = sub
+                results = sub.submit_batch(auto_tasks)
+
+            base = Path(self._email_src)
+            self._vendor_out_dir = (base if base.is_dir() else base.parent) / \
+                f"vendor_submit_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            self._vendor_results = results
+            self.email_running = False
+            self.log_q.put(("vendor_stage_done", None, None))
+            # 等主线程走完人工向导再关浏览器，期间窗口保持可见
+            self._vendor_close_event.wait(timeout=600)
+        except Exception as exc:
+            self.log_q.put(("email_log", f"[厂商提交] 失败: {exc}\n", "danger"))
+            self.log_q.put(("vendor_done", None, None))
+        finally:
+            self.email_running = False
+            if sub is not None:
+                try:
+                    sub.close()
+                except Exception:
+                    pass
+            self._vendor_submitter = None
+
+    def _on_vendor_stage_done(self):
+        """主线程：自动项跑完，把需人工的条目交给向导窗口。"""
+        import vendor_upload as vu
+
+        results = list(self._vendor_results or [])
+        entries = []
+
+        # 1) 完全无法自动的厂商
+        for t in self._vendor_tasks:
+            if t.get("mode") != "manual":
+                continue
+            entries.append({
+                "engine": t["engine"], "url": t.get("url", ""),
+                "file_name": Path(t.get("file_path", "")).name or "?",
+                "file_path": t.get("file_path", ""), "sha256": t.get("sha256", ""),
+                "threat": t.get("threat", ""), "kind": t.get("kind", ""),
+                "note": t.get("note", ""), "prefilled": False,
+            })
+
+        # 2) 自动流程里卡在验证码或直接失败的厂商，一并转人工接手
+        task_by_engine = {t["engine"]: t for t in self._vendor_tasks}
+        for r in results:
+            if r.status not in ("needs_manual", "failed"):
+                continue
+            t = task_by_engine.get(r.engine, {})
+            entries.append({
+                "engine": r.engine, "url": r.url or t.get("url", ""),
+                "file_name": r.file_name, "file_path": r.file_path,
+                "sha256": r.sha256, "threat": t.get("threat", ""),
+                "kind": t.get("kind", ""),
+                "note": (f"自动上传未完成：{r.detail}" if r.status == "failed" else r.detail),
+                "prefilled": r.status == "needs_manual",
+            })
+
+        if not entries:
+            self._finalize_vendor_submit(results)
+            return
+
+        self.email_status_label.configure(
+            text=f"待人工确认 {len(entries)} 项，请在上传向导里逐项处理")
+
+        # 这些条目在向导里会重新生成结果，这里先把原始待人工/失败结果剔掉，避免重复计入
+        replaced = {(r.engine, r.file_path) for r in results
+                    if r.status in ("needs_manual", "failed")}
+
+        def _done(answers):
+            final = [r for r in results if (r.engine, r.file_path) not in replaced]
+            for i, e in enumerate(entries):
+                status = answers.get(i) or "needs_manual"
+                final.append(vu.SubmitResult(
+                    e["engine"], e["file_name"], e["file_path"], e["sha256"],
+                    status, method="manual", url=e["url"],
+                    detail="人工提交向导确认" if status != "needs_manual"
+                           else "人工向导未处理，需补提交"))
+            self._finalize_vendor_submit(final)
+
+        from manual_submit_dialog import ManualSubmitDialog
+        ManualSubmitDialog(self.root, entries, on_done=_done)
+
+    def _finalize_vendor_submit(self, results):
+        import vendor_upload as vu
+
+        out_dir = self._vendor_out_dir or Path(self._email_src)
+        stats = vu.write_report(results, out_dir)
+        self.email_progress.configure(value=100)
+        self.email_status_label.configure(
+            text=f"厂商提交完成：已提交 {stats['submitted']} · "
+                 f"待人工 {stats['needs_manual']} · 失败 {stats['failed']}")
+        self._email_log_line(
+            f"[厂商提交] 已提交 {stats['submitted']} / 待人工 {stats['needs_manual']} / "
+            f"失败 {stats['failed']}（共 {stats['total']}）\n", "success")
+        self._email_log_line(f"[厂商提交] 报告: {stats['md']}\n")
+        # 浏览器窗口多留 15 秒供查看回执，再通知 worker 收尾关闭
+        self._email_log_line("[厂商提交] 浏览器窗口 15 秒后关闭\n")
+        self.root.after(15000, self._vendor_close_event.set)
+
+    def _gui_on_manual(self, engine, url, meta):
+        """worker 线程：把已预填的页面交给用户，等主线程弹窗确认。"""
+        self._manual_event.clear()
+        self._manual_answer = False
+        self.log_q.put(("vendor_manual", (engine, url), None))
+        self._manual_event.wait(timeout=600)
+        return self._manual_answer
 
     def _start_send_all(self):
         """主线程：打开确认窗，逐封/一键确认后再发送（一键申诉生成完成后调用）"""
